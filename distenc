@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+#
+#   SPDX-License-Identifier: CC-BY-NC-SA-4.0
+#
+#   Copyright (C) 2025-2025  NormalAddition8943 at gitHub.com
+#
+#   Licensed under the Creative Commons Attribution‑NonCommercial‑ShareAlike
+#   4.0 International License; you may not use this file except in compliance
+#   with the License. You may obtain a copy of the License at:
+#
+#     https://creativecommons.org/licenses/by-nc-sa/4.0/
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an “AS IS” BASIS, WITHOUT
+#   WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#
+
+"""
+Batch encode videos to x265 with crop detection and concurrency.
+Uses token files in a shared directory to coordinate multiple workers.
+
+Usage:
+    distenc --inputs <input_files>... --output-dir <output_dir> \
+            --stats-dir <stats_dir> --token-dir <token_dir> \
+            [--jobs <num>]
+"""
+
+import argparse
+import concurrent.futures
+import re
+import signal
+import subprocess
+import sys
+import threading
+from pathlib import Path
+from threading import Lock
+
+# Configuration
+TARGET_WIDTH = 1280
+FFMPEG_PATH = "ffmpeg"
+FFPROBE_PATH = "ffprobe"
+SAMPLES = 5
+VB_KBPS = 800
+AB_KBPS = 80
+
+DETECT_FILTER = f"scale={TARGET_WIDTH}:-1,cropdetect=round=2"
+
+BASE_X265_PARAMS = (
+    "hme=1:hme-search=hex,hex,umh:hme-range=25,25,26:subme=5:"
+    "min-keyint=360:keyint=1200:cbqpoffs=-3:crqpoffs=-3:rc-lookahead=80:"
+    "aq-mode=4:aq-strength=1.0:aq-motion=1:qcomp=0.65:bframes=6:ref=4:"
+    "level-idc=31:rd=4:dynamic-rd=4:psy-rd=1.8:psy-rdoq=1.0:deblock=-3:"
+    "tskip=1:tskip-fast=1:frame-threads=2:limit-sao=1:selective-sao=1:"
+    "no-amp=1:no-rect=1:hdr10-opt=1"
+)
+
+TOKENS_LOCK = Lock()
+INPROGRESS_TOKENS = set()
+RUNNING_PROCS = set()
+
+PROCS_LOCK = Lock()
+SHUTTING_DOWN = threading.Event()
+
+
+def run_subprocess(cmd, capture_output=False, check=True, **kwargs):
+    return subprocess.run(cmd, capture_output=capture_output, check=check, **kwargs)
+
+
+def get_video_duration(path: Path) -> float:
+    cmd = [
+        FFPROBE_PATH, "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
+    cp = run_subprocess(cmd, capture_output=True)
+    return float(cp.stdout.decode().strip())
+
+
+def get_crop_for_timestamp(input_path: Path, timestamp: float):
+    cmd = [
+        FFMPEG_PATH, "-hide_banner", "-ss", f"{timestamp:.3f}", "-i", str(input_path),
+        "-frames:v", "5", "-vf", DETECT_FILTER, "-f", "null", "-"
+    ]
+    proc = subprocess.run(cmd, capture_output=True, check=False)
+    stderr = proc.stderr.decode(errors="ignore")
+    match = re.findall(r"crop=(\d+):(\d+):(\d+):(\d+)", stderr)
+    return tuple(map(int, match[-1])) if match else None
+
+
+def detect_crop_bounds(input_path: Path) -> str:
+    duration = get_video_duration(input_path)
+    interval = duration / SAMPLES
+    min_x, min_y, max_x, max_y = float("inf"), float("inf"), 0, 0
+    for i in range(SAMPLES):
+        if SHUTTING_DOWN.is_set():
+            raise InterruptedError("Shutdown in progress")
+        at_timestamp = i * interval
+        result = get_crop_for_timestamp(input_path, at_timestamp)
+        if result:
+            w, h, x, y = result
+            min_x = min(min_x, x)
+            min_y = min(min_y, y)
+            max_x = max(max_x, x + w)
+            max_y = max(max_y, y + h)
+            print(f"Detected crop of {w}:{h}:{x}:{y} at {at_timestamp:.2f}s: {input_path.name}")
+
+    if min_x == float("inf"):
+        raise RuntimeError("No crop detected")
+
+    final_w, final_h = int(max_x - min_x), int(max_y - min_y)
+    print(f"Finalized crop {final_w}:{final_h}:{int(min_x)}:{int(min_y)}: {input_path.name}")
+
+    return (
+        f"zscale=w={TARGET_WIDTH}:h=-1:filter=spline36:param_a=5,"
+        f"crop={final_w}:{final_h}:{int(min_x)}:{int(min_y)},"
+        f"cas=strength=0.13"
+    )
+
+
+def encode_video(input_path: Path, output_path: Path, stats_path: Path, token_path: Path):
+    print(f"Encoding started: {input_path.name}")
+    with token_path.open("a") as log_file:
+        proc = None
+        try:
+            vf_filter = detect_crop_bounds(input_path)
+            base_name = input_path.stem
+
+            # First pass (turbo, no audio)
+            first_pass_cmd = [
+                FFMPEG_PATH, "-hide_banner", "-stats", "-y",
+                "-i", str(input_path),
+                "-vf", vf_filter,
+                "-c:v", "libx265",
+                "-pix_fmt", "yuv420p10le",
+                "-b:v", f"{VB_KBPS}k",
+                "-preset", "slower",
+                "-x265-params", f"pass=1:stats={stats_path}:no-slow-firstpass=1:{BASE_X265_PARAMS}",
+                "-an",
+                "-f", "null", "/dev/null" if sys.platform != "win32" else "NUL"
+            ]
+
+            # Second pass (with audio)
+            second_pass_cmd = [
+                FFMPEG_PATH, "-hide_banner", "-stats", "-y",
+                "-i", str(input_path),
+                "-vf", vf_filter,
+                "-c:v", "libx265",
+                "-pix_fmt", "yuv420p10le",
+                "-b:v", f"{VB_KBPS}k",
+                "-preset", "slower",
+                "-x265-params", f"pass=2:stats={stats_path}:{BASE_X265_PARAMS}",
+                "-filter:a", "dynaudnorm=threshold=-40dB,loudnorm=I=-14:TP=-1.0:LRA=11",
+                "-ac", "2",
+                "-c:a", "libopus",
+                "-b:a", f"{AB_KBPS}k",
+                "-frame_duration", "60",
+                str(output_path)
+            ]
+
+            for i, cmd in enumerate([first_pass_cmd, second_pass_cmd], start=1):
+                print(f"Running pass {i} for {input_path.name}")
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+                )
+                with PROCS_LOCK:
+                    RUNNING_PROCS.add(proc)
+
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    if SHUTTING_DOWN.is_set():
+                        proc.terminate()
+                        break
+                    log_file.write(line.decode(errors="ignore"))
+
+                proc.wait()
+                with PROCS_LOCK:
+                    RUNNING_PROCS.discard(proc)
+
+                if proc.returncode != 0:
+                    raise subprocess.CalledProcessError(proc.returncode, cmd)
+
+            stats_path.unlink(missing_ok=True)
+            stats_path.with_suffix(".stats.cutree").unlink(missing_ok=True)
+
+            with TOKENS_LOCK:
+                INPROGRESS_TOKENS.discard(token_path)
+            print(f"Encoding complete: {input_path.name}")
+
+        except Exception as e:
+            if proc:
+                with PROCS_LOCK:
+                    RUNNING_PROCS.discard(proc)
+
+            with TOKENS_LOCK:
+                INPROGRESS_TOKENS.discard(token_path)
+            token_path.rename(token_path.with_suffix(".error_log"))
+            output_path.unlink(missing_ok=True)
+
+            print(f"Encoding failed: {input_path.name}: {e}")
+            raise e
+
+
+def process_file(input_path: Path, output_dir: Path, stats_dir: Path,  token_dir: Path):
+    if SHUTTING_DOWN.is_set():
+        return
+
+    token_path = (token_dir / input_path.name).with_suffix(".token")
+    if token_path.exists():
+        print(f"Skipping (already encoded or in-progress): {token_path}")
+        return
+
+    output_path = output_dir / input_path.name
+    if output_path.exists():
+        print(f"Skipping (output already exists), so creating token: {output_path}")
+        token_path.touch()
+        return
+
+    with TOKENS_LOCK:
+        INPROGRESS_TOKENS.add(token_path)
+    token_path.touch(exist_ok=False)
+
+    stats_path = (stats_dir / input_path.name).with_suffix(".stats")
+
+    print(f"Starting encode for {input_path.name} with stats in ${stats_path.name}, created: {token_path}")
+    encode_video(input_path, output_path, stats_path, token_path)
+
+
+def cleanup_tokens():
+    with TOKENS_LOCK:
+        for token_path in INPROGRESS_TOKENS:
+            print(f"Cleaning up in-progress token: {token_path}")
+            token_path.unlink(missing_ok=True)
+        INPROGRESS_TOKENS.clear()
+
+
+def handle_shutdown(signum, frame):
+    print(f"\nReceived signal {signum}, shutting down...")
+    SHUTTING_DOWN.set()
+
+    with PROCS_LOCK:
+        for proc in list(RUNNING_PROCS):
+            if proc.poll() is None:
+                print(f"Terminating subprocess PID {proc.pid}")
+                proc.terminate()
+
+        for proc in list(RUNNING_PROCS):
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                print(f"Killing unresponsive subprocess PID {proc.pid}")
+                proc.kill()
+
+    cleanup_tokens()
+    sys.exit(1)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Batch x265 encode with crop detection and concurrency.")
+    parser.add_argument("-i", "--inputs", nargs="+", type=Path, required=True)
+    parser.add_argument("-o", "--output-dir", type=Path, required=True)
+    parser.add_argument("-s", "--stats-dir", type=Path, required=True)
+    parser.add_argument("-t", "--token-dir", type=Path, required=True)
+    parser.add_argument("-j", "--jobs", type=int, default=1)
+    args = parser.parse_args()
+
+    signal.signal(signal.SIGINT, handle_shutdown)
+    signal.signal(signal.SIGTERM, handle_shutdown)
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    args.stats_dir.mkdir(parents=True, exist_ok=True)
+    args.token_dir.mkdir(parents=True, exist_ok=True)
+
+    print("Starting encoding batch...")
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as executor:
+            futures = [
+                executor.submit(process_file, inp, args.output_dir, args.stats_dir, args.token_dir)
+                for inp in args.inputs if inp.is_file()
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                if SHUTTING_DOWN.is_set():
+                    break
+                try:
+                    future.result()
+                except Exception as exc:
+                    print(f"Error: {exc}", file=sys.stderr)
+    except KeyboardInterrupt:
+        handle_shutdown(signal.SIGINT, None)
+
+    cleanup_tokens()
+    print("Batch complete.")
+
+
+if __name__ == "__main__":
+    main()
