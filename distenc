@@ -53,9 +53,15 @@ def run_subprocess(cmd, capture_output=False, check=True, **kwargs):
 
 def get_video_duration(path: Path) -> float:
     cmd = [
-        FFPROBE_PATH, "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
+        FFPROBE_PATH,
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
         str(path),
     ]
     cp = run_subprocess(cmd, capture_output=True)
@@ -64,8 +70,19 @@ def get_video_duration(path: Path) -> float:
 
 def get_crop_for_timestamp(input_path: Path, timestamp: float):
     cmd = [
-        FFMPEG_PATH, "-hide_banner", "-ss", f"{timestamp:.3f}", "-i", str(input_path),
-        "-frames:v", "5", "-vf", DETECT_FILTER, "-f", "null", "-"
+        FFMPEG_PATH,
+        "-hide_banner",
+        "-ss",
+        f"{timestamp:.3f}",
+        "-i",
+        str(input_path),
+        "-frames:v",
+        "5",
+        "-vf",
+        DETECT_FILTER,
+        "-f",
+        "null",
+        "-",
     ]
     proc = subprocess.run(cmd, capture_output=True, check=False)
     stderr = proc.stderr.decode(errors="ignore")
@@ -88,13 +105,17 @@ def detect_crop_bounds(input_path: Path) -> str:
             min_y = min(min_y, y)
             max_x = max(max_x, x + w)
             max_y = max(max_y, y + h)
-            print(f"Detected crop of {w}:{h}:{x}:{y} at {at_timestamp:.2f}s: {input_path.name}")
+            print(
+                f"Detected crop of {w}:{h}:{x}:{y} at {at_timestamp:.2f}s: {input_path.name}"
+            )
 
     if min_x == float("inf"):
         raise RuntimeError("No crop detected")
 
     final_w, final_h = int(max_x - min_x), int(max_y - min_y)
-    print(f"Finalized crop {final_w}:{final_h}:{int(min_x)}:{int(min_y)}: {input_path.name}")
+    print(
+        f"Finalized crop {final_w}:{final_h}:{int(min_x)}:{int(min_y)}: {input_path.name}"
+    )
 
     return (
         f"zscale=w={TARGET_WIDTH}:h=-1:filter=spline36:param_a=5,"
@@ -103,7 +124,9 @@ def detect_crop_bounds(input_path: Path) -> str:
     )
 
 
-def encode_video(input_path: Path, output_path: Path, stats_path: Path, token_path: Path):
+def encode_video(
+    input_path: Path, output_path: Path, stats_path: Path, token_path: Path
+):
     print(f"Encoding started: {input_path.name}")
     with token_path.open("a") as log_file:
         proc = None
@@ -113,34 +136,61 @@ def encode_video(input_path: Path, output_path: Path, stats_path: Path, token_pa
 
             # First pass (turbo, no audio)
             first_pass_cmd = [
-                FFMPEG_PATH, "-hide_banner", "-stats", "-y",
-                "-i", str(input_path),
-                "-vf", vf_filter,
-                "-c:v", "libx265",
-                "-pix_fmt", "yuv420p10le",
-                "-b:v", f"{VB_KBPS}k",
-                "-preset", "slower",
-                "-x265-params", f"pass=1:stats={stats_path}:no-slow-firstpass=1:{BASE_X265_PARAMS}",
+                FFMPEG_PATH,
+                "-hide_banner",
+                "-stats",
+                "-y",
+                "-i",
+                str(input_path),
+                "-vf",
+                vf_filter,
+                "-c:v",
+                "libx265",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-b:v",
+                f"{VB_KBPS}k",
+                "-preset",
+                "slower",
+                "-x265-params",
+                f"pass=1:stats={stats_path}:no-slow-firstpass=1:{BASE_X265_PARAMS}",
                 "-an",
-                "-f", "null", "/dev/null" if sys.platform != "win32" else "NUL"
+                "-f",
+                "null",
+                "/dev/null" if sys.platform != "win32" else "NUL",
             ]
 
             # Second pass (with audio)
             second_pass_cmd = [
-                FFMPEG_PATH, "-hide_banner", "-stats", "-y",
-                "-i", str(input_path),
-                "-vf", vf_filter,
-                "-c:v", "libx265",
-                "-pix_fmt", "yuv420p10le",
-                "-b:v", f"{VB_KBPS}k",
-                "-preset", "slower",
-                "-x265-params", f"pass=2:stats={stats_path}:{BASE_X265_PARAMS}",
-                "-filter:a", "dynaudnorm=threshold=-40dB,loudnorm=I=-14:TP=-1.0:LRA=11",
-                "-ac", "2",
-                "-c:a", "libopus",
-                "-b:a", f"{AB_KBPS}k",
-                "-frame_duration", "60",
-                str(output_path)
+                FFMPEG_PATH,
+                "-hide_banner",
+                "-stats",
+                "-y",
+                "-i",
+                str(input_path),
+                "-vf",
+                vf_filter,
+                "-c:v",
+                "libx265",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-b:v",
+                f"{VB_KBPS}k",
+                "-preset",
+                "slower",
+                "-x265-params",
+                f"pass=2:stats={stats_path}:{BASE_X265_PARAMS}",
+                "-filter:a",
+                "dynaudnorm=threshold=-40dB,loudnorm=I=-14:TP=-1.0:LRA=11",
+                "-ac",
+                "2",
+                "-c:a",
+                "libopus",
+                "-b:a",
+                f"{AB_KBPS}k",
+                "-frame_duration",
+                "60",
+                str(output_path),
             ]
 
             for i, cmd in enumerate([first_pass_cmd, second_pass_cmd], start=1):
@@ -249,7 +299,9 @@ def handle_shutdown(signum, frame):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Batch x265 encode with crop detection and concurrency.")
+    parser = argparse.ArgumentParser(
+        description="Batch x265 encode with crop detection and concurrency."
+    )
     parser.add_argument("-i", "--inputs", nargs="+", type=Path, required=True)
     parser.add_argument("-o", "--output-dir", type=Path, required=True)
     parser.add_argument("-s", "--stats-dir", type=Path, required=True)
@@ -269,8 +321,11 @@ def main():
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as executor:
             futures = [
-                executor.submit(process_file, inp, args.output_dir, args.stats_dir, args.token_dir)
-                for inp in args.inputs if inp.is_file()
+                executor.submit(
+                    process_file, inp, args.output_dir, args.stats_dir, args.token_dir
+                )
+                for inp in args.inputs
+                if inp.is_file()
             ]
             for future in concurrent.futures.as_completed(futures):
                 if SHUTTING_DOWN.is_set():
