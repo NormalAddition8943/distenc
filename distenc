@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Batch encode videos to x265 with crop detection and concurrency.
-Uses token files in a shared directory to coordinate multiple workers.
+Uses token files in a shared directory to coordinate encoding jobs.
 
 Usage:
     distenc --inputs <input_files>... --output-dir <output_dir> \
