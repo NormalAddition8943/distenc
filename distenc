@@ -1,20 +1,4 @@
 #!/usr/bin/env python3
-#
-#   SPDX-License-Identifier: CC-BY-NC-SA-4.0
-#
-#   Copyright (C) 2025-2025  NormalAddition8943 at gitHub.com
-#
-#   Licensed under the Creative Commons Attribution‑NonCommercial‑ShareAlike
-#   4.0 International License; you may not use this file except in compliance
-#   with the License. You may obtain a copy of the License at:
-#
-#     https://creativecommons.org/licenses/by-nc-sa/4.0/
-#
-#   Unless required by applicable law or agreed to in writing, software
-#   distributed under the License is distributed on an “AS IS” BASIS, WITHOUT
-#   WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#
-
 """
 Batch encode videos to x265 with crop detection and concurrency.
 Uses token files in a shared directory to coordinate multiple workers.
