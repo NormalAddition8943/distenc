@@ -15,6 +15,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 from pathlib import Path
 from threading import Lock
@@ -185,7 +186,13 @@ def encode_video(input_path: Path, output_path: Path, stats_path: Path, token_pa
             raise e
 
 
-def process_file(input_path: Path, output_dir: Path, stats_dir: Path,  token_dir: Path):
+def temp_filename(dir: Path, prefix="", suffix=""):
+    fd, path = tempfile.mkstemp(dir=dir, prefix=prefix, suffix=suffix)
+    Path(path).unlink()  # Remove the file, keeping just the name
+    return Path(path)
+
+
+def process_file(input_path: Path, output_dir: Path, stats_dir: Path, token_dir: Path):
     if SHUTTING_DOWN.is_set():
         return
 
@@ -204,9 +211,11 @@ def process_file(input_path: Path, output_dir: Path, stats_dir: Path,  token_dir
         INPROGRESS_TOKENS.add(token_path)
     token_path.touch(exist_ok=False)
 
-    stats_path = (stats_dir / input_path.name).with_suffix(".stats")
+    stats_path = temp_filename(stats_dir, suffix=".stats")
 
-    print(f"Starting encode for {input_path.name} with stats in ${stats_path.name}, created: {token_path}")
+    print(
+        f"Starting encode for {input_path.name} with stats in ${stats_path.name}, created: {token_path}"
+    )
     encode_video(input_path, output_path, stats_path, token_path)
 
 
