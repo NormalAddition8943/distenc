@@ -22,22 +22,24 @@ from pathlib import Path
 from threading import Lock
 
 # Configuration
-TARGET_WIDTH = 1280
+TARGET_WIDTH = "1280"
+TARGET_HEIGHT = "-2"
 FFMPEG_PATH = "ffmpeg"
 FFPROBE_PATH = "ffprobe"
 SAMPLES = 5
 VB_KBPS = 800
 AB_KBPS = 80
 
-DETECT_FILTER = f"scale={TARGET_WIDTH}:-1,cropdetect=round=2"
+DETECT_FILTER = f"scale={TARGET_WIDTH}:{TARGET_HEIGHT},cropdetect=round=2"
 
 BASE_X265_PARAMS = (
     "hme=1:hme-search=hex,hex,umh:hme-range=25,25,26:subme=5:"
     "min-keyint=24:keyint=800:cbqpoffs=-3:crqpoffs=-3:rc-lookahead=80:"
     "aq-mode=4:aq-strength=1.0:aq-motion=1:qcomp=0.65:bframes=6:ref=4:"
-    "level-idc=31:rd=4:dynamic-rd=4:psy-rd=1.8:psy-rdoq=1.0:deblock=-3:"
+    "rd=4:dynamic-rd=4:psy-rd=1.8:psy-rdoq=1.0:deblock=-3:"
     "tskip=1:tskip-fast=1:frame-threads=2:limit-sao=1:selective-sao=1:"
-    "no-amp=1:no-rect=1:hdr10-opt=1"
+    "no-amp=1:no-rect=1:"
+    "no-high-tier=1:hdr10-opt=1:vbv-maxrate=8000:vbv-bufsize=12000"
 )
 
 TOKENS_LOCK = Lock()
@@ -119,7 +121,7 @@ def detect_crop_bounds(input_path: Path) -> str:
     )
 
     return (
-        f"zscale=w={TARGET_WIDTH}:h=-1:filter=spline36:param_a=5,"
+        f"zscale={TARGET_WIDTH}:{TARGET_HEIGHT}:filter=spline36:param_a=5,"
         f"crop={final_w}:{final_h}:{int(min_x)}:{int(min_y)},"
         f"cas=strength=0.13"
     )
