@@ -11,6 +11,7 @@ Usage:
 
 import argparse
 import asyncio
+import glob
 import json
 import logging
 import os
@@ -108,7 +109,7 @@ class EncodingJob:
     input_path: Path
     output_path: Path
     token_path: Path
-    temp_path: Path
+    temp_path: Optional[Path] = None
     status: EncodingStatus = EncodingStatus.PENDING
     start_time: Optional[float] = None
     end_time: Optional[float] = None
@@ -315,6 +316,8 @@ class VideoEncoder:
         """Build the two-pass encoding commands."""
         vf_filter = video_info.crop_params.to_filter_string(self.config)
         dolby_vision_flag = "1" if video_info.has_dolby_vision else "0"
+
+        assert job.temp_path is not None
         stats_path = job.temp_path.with_suffix(".stats")
 
         base_cmd = [
@@ -422,12 +425,10 @@ class VideoEncoder:
             job.end_time = time.time()
 
             # Cleanup temporary files
-            stats_pattern = str(job.temp_path.with_suffix(".stats")) + "*"
-            import glob
-
-            for stats_file in glob.glob(stats_pattern):
-                Path(stats_file).unlink(missing_ok=True)
-
+            if job.temp_path:
+                for temp_file in glob.glob(str(job.temp_path) + "*"):
+                    Path(temp_file).unlink(missing_ok=True)
+                job.temp_path = None
 
 class BatchProcessor:
     """Orchestrates batch processing with proper resource management."""
@@ -464,37 +465,45 @@ class BatchProcessor:
 
         return True
 
-    def _create_job(
-        self, input_path: Path, output_dir: Path, scratch_dir: Path, token_dir: Path
-    ) -> Optional[EncodingJob]:
-        """Create an encoding job if needed."""
+    def _create_job_template(
+        self, input_path: Path, output_dir: Path, token_dir: Path
+    ) -> EncodingJob:
+        """Create a job template without claiming it yet."""
         token_path = (token_dir / input_path.name).with_suffix(".token")
         output_path = output_dir / input_path.name
 
-        # Skip if already processed
-        if token_path.exists():
-            self.logger.info(f"Skipping (token exists): {input_path.name}")
-            return None
-
-        if output_path.exists():
-            self.logger.info(f"Output exists, creating token: {output_path.name}")
-            token_path.touch()
-            return None
-
-        # Create temporary file
-        with tempfile.NamedTemporaryFile(dir=scratch_dir, delete=False) as tmp:
-            temp_path = Path(tmp.name)
-
-        job = EncodingJob(
+        return EncodingJob(
             input_path=input_path,
             output_path=output_path,
             token_path=token_path,
-            temp_path=temp_path,
         )
 
-        # Create token to mark job as claimed
-        token_path.touch()
-        return job
+    def _try_claim_job(self, job: EncodingJob, scratch_dir: Path) -> bool:
+        """Try to claim a job by creating its token. Returns True if successfully claimed."""
+        # Check if already processed
+        if job.output_path.exists():
+            self.logger.info(f"Output already exists: {job.output_path.name}")
+            # Create token to mark as done
+            job.token_path.touch()
+            return False
+
+        # Try to claim the job atomically
+        try:
+            # Use exclusive creation to prevent race conditions
+            with job.token_path.open("x") as f:
+                f.write(f"Claimed by PID {os.getpid()} at {time.time()}\n")
+            
+            # Create temporary file now that we've claimed the job
+            with tempfile.NamedTemporaryFile(dir=scratch_dir, delete=False) as tmp:
+                job.temp_path = Path(tmp.name)
+            
+            self.logger.info(f"Successfully claimed job: {job.input_path.name}")
+            return True
+            
+        except FileExistsError:
+            # Another process already claimed this job
+            self.logger.info(f"Job already claimed by another process: {job.input_path.name}")
+            return False
 
     @asynccontextmanager
     async def _job_context(self, job: EncodingJob) -> AsyncGenerator[EncodingJob, None]:
@@ -508,10 +517,15 @@ class BatchProcessor:
             if job.status == EncodingStatus.FAILED and job.token_path.exists():
                 job.token_path.unlink(missing_ok=True)
 
-    async def _process_job(self, job: EncodingJob, semaphore: asyncio.Semaphore):
+    async def _process_job(self, job: EncodingJob, semaphore: asyncio.Semaphore, scratch_dir: Path):
         """Process a single encoding job with concurrency control."""
         async with semaphore:
             if self._shutdown_event.is_set():
+                job.status = EncodingStatus.SKIPPED
+                return
+
+            # Try to claim the job just before processing
+            if not self._try_claim_job(job, scratch_dir):
                 job.status = EncodingStatus.SKIPPED
                 return
 
@@ -534,26 +548,25 @@ class BatchProcessor:
         for directory in [output_dir, scratch_dir, token_dir]:
             directory.mkdir(parents=True, exist_ok=True)
 
-        # Create jobs
+        # Create job templates (don't claim them yet)
         jobs = []
         for input_file in input_files:
             if not input_file.is_file():
                 self.logger.warning(f"Skipping non-file: {input_file}")
                 continue
 
-            job = self._create_job(input_file, output_dir, scratch_dir, token_dir)
-            if job:
-                jobs.append(job)
+            job = self._create_job_template(input_file, output_dir, token_dir)
+            jobs.append(job)
 
         if not jobs:
             self.logger.info("No jobs to process")
             return True
 
-        self.logger.info(f"Processing {len(jobs)} jobs with {max_workers} workers")
+        self.logger.info(f"Found {len(jobs)} potential jobs with {max_workers} workers")
 
         # Process jobs with concurrency control
         semaphore = asyncio.Semaphore(max_workers)
-        tasks = [self._process_job(job, semaphore) for job in jobs]
+        tasks = [self._process_job(job, semaphore, scratch_dir) for job in jobs]
 
         try:
             await asyncio.gather(*tasks)
