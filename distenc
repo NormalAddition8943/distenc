@@ -11,6 +11,8 @@ Usage:
 
 import argparse
 import concurrent.futures
+import glob
+import json
 import os
 import re
 import signal
@@ -19,13 +21,16 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
+from shutil import which as Which
 from threading import Lock
 
 # Configuration
-TARGET_WIDTH = "1280"
-TARGET_HEIGHT = "-2"
+TARGET_WIDTH = "-2"
+TARGET_HEIGHT = "720"
+
 FFMPEG_PATH = "ffmpeg"
 FFPROBE_PATH = "ffprobe"
+
 SAMPLES = 5
 VB_KBPS = 800
 AB_KBPS = 80
@@ -34,7 +39,7 @@ DETECT_FILTER = f"scale={TARGET_WIDTH}:{TARGET_HEIGHT},cropdetect=round=2"
 
 BASE_X265_PARAMS = (
     "hme=1:hme-search=hex,hex,umh:hme-range=25,25,26:subme=5:"
-    "min-keyint=24:keyint=800:cbqpoffs=-3:crqpoffs=-3:rc-lookahead=80:"
+    "min-keyint=24:keyint=800:cbqpoffs=-3:crqpoffs=-3:rc-lookahead=48:"
     "aq-mode=4:aq-strength=1.0:aq-motion=1:qcomp=0.65:bframes=6:ref=4:"
     "rd=4:dynamic-rd=4:psy-rd=1.8:psy-rdoq=1.0:deblock=-3:"
     "tskip=1:tskip-fast=1:frame-threads=2:limit-sao=1:selective-sao=1:"
@@ -50,8 +55,14 @@ PROCS_LOCK = Lock()
 SHUTTING_DOWN = threading.Event()
 
 
-def run_subprocess(cmd, check=True):
-    return subprocess.run(cmd, capture_output=True, check=check, stdin=subprocess.DEVNULL, env={**os.environ, "TERM": "dumb"})
+def run(cmd, check=True):
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        check=check,
+        stdin=subprocess.DEVNULL,
+        env={**os.environ, "TERM": "dumb"},
+    )
 
 
 def get_video_duration(path: Path) -> float:
@@ -67,8 +78,34 @@ def get_video_duration(path: Path) -> float:
         "default=noprint_wrappers=1:nokey=1",
         str(path),
     ]
-    cp = run_subprocess(cmd)
+    cp = run(cmd)
     return float(cp.stdout.decode().strip())
+
+
+def get_dolby_vision_flag(input_path: Path) -> str:
+    """
+    Returns '1' if the input video file contains Dolby Vision side data,
+    otherwise returns '0'.
+    """
+    cmd = [
+        "ffprobe",
+        "-v",
+        "quiet",
+        "-select_streams",
+        "v:0",
+        "-show_streams",
+        "-print_format",
+        "json",
+        str(input_path),
+    ]
+    cp = run(cmd)
+    data = json.loads(cp.stdout)
+    stream = data.get("streams", [{}])[0]
+    side_data_list = stream.get("side_data_list", [])
+    is_present = any(
+        sd.get("side_data_type") == "DOVI configuration record" for sd in side_data_list
+    )
+    return str(int(is_present))
 
 
 def get_crop_for_timestamp(input_path: Path, timestamp: float):
@@ -87,8 +124,8 @@ def get_crop_for_timestamp(input_path: Path, timestamp: float):
         "null",
         "-",
     ]
-    proc = run_subprocess(cmd, check=False)
-    stderr = proc.stderr.decode(errors="ignore")
+    cp = run(cmd, check=False)
+    stderr = cp.stderr.decode(errors="ignore")
     match = re.findall(r"crop=(\d+):(\d+):(\d+):(\d+)", stderr)
     return tuple(map(int, match[-1])) if match else None
 
@@ -128,124 +165,109 @@ def detect_crop_bounds(input_path: Path) -> str:
 
 
 def encode_video(
-    input_path: Path, output_path: Path, stats_path: Path, token_path: Path
+    input_path: Path, output_path: Path, temp_path: Path, token_path: Path
 ):
-    print(f"Encoding started: {input_path.name}")
-    with token_path.open("a") as log_file:
-        proc = None
-        try:
-            vf_filter = detect_crop_bounds(input_path)
-            base_name = input_path.stem
+    vf_filter = detect_crop_bounds(input_path)
 
-            # First pass (turbo, no audio)
-            first_pass_cmd = [
-                FFMPEG_PATH,
-                "-hide_banner",
-                "-stats",
-                "-y",
-                "-i",
-                str(input_path),
-                "-vf",
-                vf_filter,
-                "-c:v",
-                "libx265",
-                "-pix_fmt",
-                "yuv420p10le",
-                "-b:v",
-                f"{VB_KBPS}k",
-                "-preset",
-                "slower",
-                "-x265-params",
-                f"pass=1:stats={stats_path}:no-slow-firstpass=1:{BASE_X265_PARAMS}",
-                "-an",
-                "-f",
-                "null",
-                "/dev/null" if sys.platform != "win32" else "NUL",
-            ]
+    dolby_vision_flag = get_dolby_vision_flag(input_path)
 
-            # Second pass (with audio)
-            second_pass_cmd = [
-                FFMPEG_PATH,
-                "-hide_banner",
-                "-stats",
-                "-y",
-                "-i",
-                str(input_path),
-                "-vf",
-                vf_filter,
-                "-c:v",
-                "libx265",
-                "-pix_fmt",
-                "yuv420p10le",
-                "-b:v",
-                f"{VB_KBPS}k",
-                "-preset",
-                "slower",
-                "-x265-params",
-                f"pass=2:stats={stats_path}:{BASE_X265_PARAMS}",
-                "-filter:a",
-                "dynaudnorm=threshold=-40dB,loudnorm=I=-14:TP=-1.0:LRA=11",
-                "-ac",
-                "2",
-                "-c:a",
-                "libopus",
-                "-b:a",
-                f"{AB_KBPS}k",
-                "-frame_duration",
-                "60",
-                str(output_path),
-            ]
+    stats_path = temp_path.with_suffix(".stats")
 
-            for i, cmd in enumerate([first_pass_cmd, second_pass_cmd], start=1):
-                print(f"Running pass {i} for {input_path.name}")
-                proc = subprocess.Popen(
-                    cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
-                )
-                with PROCS_LOCK:
-                    RUNNING_PROCS.add(proc)
+    # First pass (turbo, no audio)
+    first_pass_cmd = [
+        FFMPEG_PATH,
+        "-hide_banner",
+        "-stats",
+        "-y",
+        "-i",
+        str(input_path),
+        "-vf",
+        vf_filter,
+        "-dolbyvision",
+        dolby_vision_flag,
+        "-c:v",
+        "libx265",
+        "-pix_fmt",
+        "yuv420p10le",
+        "-b:v",
+        f"{VB_KBPS}k",
+        "-preset",
+        "slower",
+        "-x265-params",
+        f"pass=1:stats={stats_path}:no-slow-firstpass=1:{BASE_X265_PARAMS}",
+        "-an",
+        "-f",
+        "null",
+        "/dev/null" if sys.platform != "win32" else "NUL",
+    ]
 
-                assert proc.stdout is not None
-                for line in proc.stdout:
-                    if SHUTTING_DOWN.is_set():
-                        proc.terminate()
-                        break
-                    log_file.write(line.decode(errors="ignore"))
+    # Second pass (with audio)
+    second_pass_cmd = [
+        FFMPEG_PATH,
+        "-hide_banner",
+        "-stats",
+        "-y",
+        "-i",
+        str(input_path),
+        "-vf",
+        vf_filter,
+        "-dolbyvision",
+        dolby_vision_flag,
+        "-c:v",
+        "libx265",
+        "-pix_fmt",
+        "yuv420p10le",
+        "-b:v",
+        f"{VB_KBPS}k",
+        "-preset",
+        "slower",
+        "-x265-params",
+        f"pass=2:stats={stats_path}:{BASE_X265_PARAMS}",
+        "-filter:a",
+        "dynaudnorm=threshold=-40dB,loudnorm=I=-17:TP=-1.0:LRA=14",
+        "-ac",
+        "2",
+        "-c:a",
+        "libopus",
+        "-b:a",
+        f"{AB_KBPS}k",
+        "-frame_duration",
+        "60",
+        str(output_path),
+    ]
 
-                proc.wait()
-                with PROCS_LOCK:
-                    RUNNING_PROCS.discard(proc)
+    print(f"Running first pass for {input_path.name}")
+    cp = None
+    with token_path.open("w") as log_file:
+        cp = subprocess.run(first_pass_cmd, stdout=log_file, stderr=log_file)
 
-                if proc.returncode != 0:
-                    raise subprocess.CalledProcessError(proc.returncode, cmd)
+    if cp.returncode == 0:
+        print(f"Running second pass for {input_path.name}")
+        with token_path.open("a") as log_file:
+            cp = subprocess.run(second_pass_cmd, stdout=log_file, stderr=log_file)
 
-            stats_path.unlink(missing_ok=True)
-            stats_path.with_suffix(".stats.cutree").unlink(missing_ok=True)
+    if cp.returncode == 0:
+        print(f"Encoding complete: {input_path.name}")
+    else:
+        print(f"Encoding failed: {input_path.name}")
+        token_path.rename(token_path.with_suffix(".error_log"))
+        output_path.unlink(missing_ok=True)
 
-            with TOKENS_LOCK:
-                INPROGRESS_TOKENS.discard(token_path)
-            print(f"Encoding complete: {input_path.name}")
+    for s in glob.glob(str(stats_path) + "*"):
+        Path(s).unlink(missing_ok=True)
 
-        except Exception as e:
-            if proc:
-                with PROCS_LOCK:
-                    RUNNING_PROCS.discard(proc)
-
-            with TOKENS_LOCK:
-                INPROGRESS_TOKENS.discard(token_path)
-            token_path.rename(token_path.with_suffix(".error_log"))
-            output_path.unlink(missing_ok=True)
-
-            print(f"Encoding failed: {input_path.name}: {e}")
-            raise e
+    INPROGRESS_TOKENS.discard(token_path)
 
 
-def temp_filename(dir: Path, prefix="", suffix=""):
-    fd, path = tempfile.mkstemp(dir=dir, prefix=prefix, suffix=suffix)
+def temp_filename(base_dir: Path, prefix="", suffix=""):
+    fd, path = tempfile.mkstemp(dir=base_dir, prefix=prefix, suffix=suffix)
     Path(path).unlink()  # Remove the file, keeping just the name
     return Path(path)
 
 
-def process_file(input_path: Path, output_dir: Path, stats_dir: Path, token_dir: Path):
+def process_file(
+    input_path: Path, output_dir: Path, scratch_dir: Path, token_dir: Path
+):
     if SHUTTING_DOWN.is_set():
         return
 
@@ -264,18 +286,20 @@ def process_file(input_path: Path, output_dir: Path, stats_dir: Path, token_dir:
         INPROGRESS_TOKENS.add(token_path)
     token_path.touch(exist_ok=False)
 
-    stats_path = temp_filename(stats_dir, suffix=".stats")
+    temp_path = temp_filename(scratch_dir)
 
     print(
-        f"Starting encode for {input_path.name} with stats in ${stats_path.name}, created: {token_path}"
+        f"Starting encode for {input_path.name} with scratch files {temp_path}.*, created: {token_path}"
     )
-    encode_video(input_path, output_path, stats_path, token_path)
+    encode_video(input_path, output_path, temp_path, token_path)
+
 
 def restore_terminal():
     try:
         os.system("stty sane")  # resets echo, line discipline, etc.
     except Exception:
         print("Could not restore terminal.", file=sys.stderr)
+
 
 def cleanup_tokens():
     with TOKENS_LOCK:
@@ -307,22 +331,48 @@ def handle_shutdown(signum, frame):
     sys.exit(1)
 
 
+def is_tool_available(command_name: str, download_url: str):
+    if Which(command_name):
+        return True  # Tool is available; do nothing
+
+    print(f"'{command_name}' is not found in your system PATH.")
+    print(f"Please download it from: {download_url}")
+    print("After downloading, ensure it is placed in a directory listed in your PATH.")
+    return False
+
+
+def all_tools_available():
+    all_available = True
+
+    for tool, url in [
+        (FFMPEG_PATH, "https://ffmpeg.org/"),
+        (FFPROBE_PATH, "https://ffmpeg.org/"),
+    ]:
+        if not is_tool_available(tool, url):
+            all_available = False
+
+    return all_available
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Batch x265 encode with crop detection and concurrency."
+        description="Batch x265 encode with crop detection, Dolby Vision handling, and concurrent execution."
     )
     parser.add_argument("-i", "--inputs", nargs="+", type=Path, required=True)
     parser.add_argument("-o", "--output-dir", type=Path, required=True)
-    parser.add_argument("-s", "--stats-dir", type=Path, required=True)
+    parser.add_argument("-s", "--scratch-dir", type=Path, required=True)
     parser.add_argument("-t", "--token-dir", type=Path, required=True)
     parser.add_argument("-j", "--jobs", type=int, default=1)
     args = parser.parse_args()
+
+    if not all_tools_available():
+        return
 
     signal.signal(signal.SIGINT, handle_shutdown)
     signal.signal(signal.SIGTERM, handle_shutdown)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    args.stats_dir.mkdir(parents=True, exist_ok=True)
+    args.scratch_dir.mkdir(parents=True, exist_ok=True)
     args.token_dir.mkdir(parents=True, exist_ok=True)
 
     print("Starting encoding batch...")
@@ -331,7 +381,7 @@ def main():
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as executor:
             futures = [
                 executor.submit(
-                    process_file, inp, args.output_dir, args.stats_dir, args.token_dir
+                    process_file, inp, args.output_dir, args.scratch_dir, args.token_dir
                 )
                 for inp in args.inputs
                 if inp.is_file()
