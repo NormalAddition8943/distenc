@@ -6,7 +6,8 @@ Uses token files in a shared directory to coordinate encoding jobs.
 Usage:
     distenc --inputs <input_files>... --output-dir <output_dir> \
             --scratch-dir <scratch_dir> --token-dir <token_dir> \
-            [--jobs <num>]
+            [--jobs <num>] [--end-first-chapter <seconds>,<multiplier>] \
+            [--after-last-chapter <multiplier>]
 """
 
 import argparse
@@ -40,6 +41,23 @@ class EncodingStatus(Enum):
 
 
 @dataclass
+class ZoneConfig:
+    """Configuration for x265 zones."""
+
+    end_first_chapter: Optional[Tuple[int, float]] = None  # (seconds_before, multiplier)
+    after_last_chapter: Optional[float] = None  # multiplier
+
+
+@dataclass
+class Chapter:
+    """Represents a video chapter."""
+
+    start_time: float  # in seconds
+    end_time: Optional[float] = None
+    title: Optional[str] = None
+
+
+@dataclass
 class Config:
     """Configuration for video encoding."""
 
@@ -66,6 +84,9 @@ class Config:
 
     # Audio processing
     audio_filter: str = "dynaudnorm=threshold=-40dB,loudnorm=I=-15:TP=-1.0:LRA=12"
+
+    # Zone configuration
+    zone_config: ZoneConfig = field(default_factory=ZoneConfig)
 
     @property
     def detect_filter(self) -> str:
@@ -98,8 +119,10 @@ class VideoInfo:
 
     path: Path
     duration: Optional[float] = None
+    frame_rate: Optional[float] = None
     has_dolby_vision: Optional[bool] = None
     crop_params: Optional[CropParameters] = None
+    chapters: List[Chapter] = field(default_factory=list)
 
 
 @dataclass
@@ -125,8 +148,6 @@ class EncodingJob:
 
 class FFmpegError(Exception):
     """Custom exception for FFmpeg-related errors."""
-
-    pass
 
 
 class VideoAnalyzer:
@@ -172,23 +193,34 @@ class VideoAnalyzer:
         """Get comprehensive video information."""
         info = VideoInfo(path)
 
-        # Get duration and Dolby Vision info in parallel
+        # Get all info in parallel
         duration_task = self._get_duration(path)
+        frame_rate_task = self._get_frame_rate(path)
         dv_task = self._has_dolby_vision(path)
+        chapters_task = self._get_chapters(path)
 
-        info.duration, info.has_dolby_vision = await asyncio.gather(
-            duration_task, dv_task, return_exceptions=True
+        results = await asyncio.gather(
+            duration_task, frame_rate_task, dv_task, chapters_task,
+            return_exceptions=True
         )
+
+        info.duration, info.frame_rate, info.has_dolby_vision, info.chapters = results
 
         # Handle exceptions
         if isinstance(info.duration, Exception):
             self.logger.warning(f"Could not get duration for {path}: {info.duration}")
             info.duration = None
+        if isinstance(info.frame_rate, Exception):
+            self.logger.warning(f"Could not get frame rate for {path}: {info.frame_rate}")
+            info.frame_rate = None
         if isinstance(info.has_dolby_vision, Exception):
             self.logger.warning(
                 f"Could not check Dolby Vision for {path}: {info.has_dolby_vision}"
             )
             info.has_dolby_vision = False
+        if isinstance(info.chapters, Exception):
+            self.logger.warning(f"Could not get chapters for {path}: {info.chapters}")
+            info.chapters = []
 
         return info
 
@@ -208,6 +240,30 @@ class VideoAnalyzer:
         ]
         result = await self._run_command(cmd)
         return float(result.stdout.decode().strip())
+
+    async def _get_frame_rate(self, path: Path) -> float:
+        """Get video frame rate."""
+        cmd = [
+            self.config.ffprobe_path,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=r_frame_rate",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ]
+        result = await self._run_command(cmd)
+        frame_rate_str = result.stdout.decode().strip()
+
+        # Handle fractional frame rates like "24000/1001"
+        if '/' in frame_rate_str:
+            num, den = map(int, frame_rate_str.split('/'))
+            return num / den
+        else:
+            return float(frame_rate_str)
 
     async def _has_dolby_vision(self, path: Path) -> bool:
         """Check if video has Dolby Vision metadata."""
@@ -230,6 +286,45 @@ class VideoAnalyzer:
             sd.get("side_data_type") == "DOVI configuration record"
             for sd in side_data_list
         )
+
+    async def _get_chapters(self, path: Path) -> List[Chapter]:
+        """Get chapter information from the video."""
+        cmd = [
+            self.config.ffprobe_path,
+            "-v",
+            "quiet",
+            "-show_chapters",
+            "-print_format",
+            "json",
+            str(path),
+        ]
+
+        try:
+            result = await self._run_command(cmd)
+            data = json.loads(result.stdout.decode())
+            chapters = []
+
+            for chapter_data in data.get("chapters", []):
+                start_time = float(chapter_data.get("start_time", 0))
+                end_time = chapter_data.get("end_time")
+                if end_time is not None:
+                    end_time = float(end_time)
+
+                title = None
+                tags = chapter_data.get("tags", {})
+                if isinstance(tags, dict):
+                    title = tags.get("title") or tags.get("TITLE")
+
+                chapters.append(Chapter(
+                    start_time=start_time,
+                    end_time=end_time,
+                    title=title
+                ))
+
+            return chapters
+
+        except (FFmpegError, json.JSONDecodeError, KeyError):
+            return []
 
     async def _detect_crop_at_timestamp(
         self, path: Path, timestamp: float
@@ -302,12 +397,70 @@ class VideoAnalyzer:
         return crop_params
 
 
+class ZoneCalculator:
+    """Calculates x265 zones based on chapters and configuration."""
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.logger = logging.getLogger(__name__)
+
+    def calculate_zones(self, video_info: VideoInfo) -> str:
+        """Calculate x265 zones parameter based on chapters and config."""
+        if not self.config.zone_config.end_first_chapter and not self.config.zone_config.after_last_chapter:
+            return ""
+
+        if not video_info.chapters or not video_info.duration or not video_info.frame_rate:
+            self.logger.info(f"Cannot calculate zones for {video_info.path.name}: missing chapters, duration, or frame rate")
+            return ""
+
+        zones = []
+
+        # End of first chapter zone
+        if self.config.zone_config.end_first_chapter:
+            first_chapter = min(video_info.chapters, key=lambda c: c.start_time)
+
+            # Check if first chapter is within first 10 minutes
+            if first_chapter.end_time <= 600:  # 10 minutes = 600 seconds
+                seconds_before, multiplier = self.config.zone_config.end_first_chapter
+
+                end_time = first_chapter.end_time
+                start_time = max(0, end_time - seconds_before)
+
+                start_frame = int(start_time * video_info.frame_rate)
+                end_frame = int(end_time * video_info.frame_rate)
+
+                if start_frame < end_frame:
+                    zones.append(f"{start_frame},{end_frame},b={multiplier}")
+                    self.logger.info(f"Added end-first-chapter zone: frames {start_frame}-{end_frame}, multiplier {multiplier}")
+
+        # After last chapter zone
+        if self.config.zone_config.after_last_chapter:
+            last_chapter = max(video_info.chapters, key=lambda c: c.start_time)
+
+            # Check if last chapter is within last 10 minutes
+            if last_chapter.start_time >= video_info.duration - 600:  # Last 10 minutes
+                multiplier = self.config.zone_config.after_last_chapter
+
+                start_time = last_chapter.start_time
+                end_time = video_info.duration
+
+                start_frame = int(start_time * video_info.frame_rate)
+                end_frame = int(end_time * video_info.frame_rate)
+
+                if start_frame < end_frame:
+                    zones.append(f"{start_frame},{end_frame},b={multiplier}")
+                    self.logger.info(f"Added after-last-chapter zone: frames {start_frame}-{end_frame}, multiplier {multiplier}")
+
+        return "/".join(zones) if zones else ""
+
+
 class VideoEncoder:
     """Handles video encoding operations."""
 
     def __init__(self, config: Config, analyzer: VideoAnalyzer):
         self.config = config
         self.analyzer = analyzer
+        self.zone_calculator = ZoneCalculator(config)
         self.logger = logging.getLogger(__name__)
 
     def _build_encoding_commands(
@@ -319,6 +472,16 @@ class VideoEncoder:
 
         assert job.temp_path is not None
         stats_path = job.temp_path.with_suffix(".stats")
+
+        # Calculate zones
+        zones = self.zone_calculator.calculate_zones(video_info)
+
+        # Build x265 parameters
+        x265_params_base = ""
+        # self.config.x265_params
+        if zones:
+            x265_params_base = f"zones={zones}:{x265_params_base}"
+            self.logger.info(f"Using zones for {job.input_path.name}: {zones}")
 
         base_cmd = [
             self.config.ffmpeg_path,
@@ -338,13 +501,13 @@ class VideoEncoder:
             "-b:v",
             f"{self.config.video_bitrate_kbps}k",
             "-preset",
-            "slower",
+            "veryfast",
         ]
 
         # First pass (analysis)
         first_pass = base_cmd + [
             "-x265-params",
-            f"pass=1:stats={stats_path}:no-slow-firstpass=1:{self.config.x265_params}",
+            f"pass=1:stats={stats_path}:no-slow-firstpass=1:{x265_params_base}",
             "-an",
             "-f",
             "null",
@@ -354,7 +517,7 @@ class VideoEncoder:
         # Second pass (final encode)
         second_pass = base_cmd + [
             "-x265-params",
-            f"pass=2:stats={stats_path}:{self.config.x265_params}",
+            f"pass=2:stats={stats_path}:{x265_params_base}",
             "-filter:a",
             self.config.audio_filter,
             "-ac",
@@ -440,6 +603,7 @@ class BatchProcessor:
         self.logger = logging.getLogger(__name__)
         self._shutdown_event = asyncio.Event()
         self._active_jobs: Dict[Path, EncodingJob] = {}
+        self._setup_signal_handlers()
 
     def _setup_signal_handlers(self):
         """Setup graceful shutdown signal handlers."""
@@ -492,14 +656,14 @@ class BatchProcessor:
             # Use exclusive creation to prevent race conditions
             with job.token_path.open("x") as f:
                 f.write(f"Claimed by PID {os.getpid()} at {time.time()}\n")
-            
+
             # Create temporary file now that we've claimed the job
             with tempfile.NamedTemporaryFile(dir=scratch_dir, delete=False) as tmp:
                 job.temp_path = Path(tmp.name)
-            
+
             self.logger.info(f"Successfully claimed job: {job.input_path.name}")
             return True
-            
+
         except FileExistsError:
             # Another process already claimed this job
             self.logger.info(f"Job already claimed by another process: {job.input_path.name}")
@@ -585,6 +749,42 @@ class BatchProcessor:
         return failed == 0
 
 
+def parse_zone_config(before_first: Optional[str], after_last: Optional[str]) -> ZoneConfig:
+    """Parse zone configuration from command line arguments."""
+    zone_config = ZoneConfig()
+
+    if before_first:
+        try:
+            parts = before_first.split(',')
+            if len(parts) != 2:
+                raise ValueError("end-first-chapter must be in format 'seconds,multiplier'")
+
+            seconds_before = int(parts[0])
+            multiplier = float(parts[1])
+
+            if seconds_before < 0:
+                raise ValueError("seconds before must be non-negative")
+            if multiplier <= 0:
+                raise ValueError("multiplier must be positive")
+
+            zone_config.end_first_chapter = (seconds_before, multiplier)
+
+        except (ValueError, IndexError) as e:
+            raise argparse.ArgumentTypeError(f"Invalid end-first-chapter format: {e}")
+
+    if after_last:
+        try:
+            multiplier = float(after_last)
+            if multiplier <= 0:
+                raise ValueError("multiplier must be positive")
+            zone_config.after_last_chapter = multiplier
+
+        except ValueError as e:
+            raise argparse.ArgumentTypeError(f"Invalid after-last-chapter format: {e}")
+
+    return zone_config
+
+
 def setup_logging(verbose: bool = False):
     """Setup logging configuration."""
     level = logging.DEBUG if verbose else logging.INFO
@@ -600,7 +800,7 @@ def setup_logging(verbose: bool = False):
 async def main_async():
     """Async main function."""
     parser = argparse.ArgumentParser(
-        description="Batch x265 encode with crop detection, Dolby Vision, and async concurrency."
+        description="Batch x265 encode with crop detection, Dolby Vision, zones, and async concurrency."
     )
     parser.add_argument(
         "-i",
@@ -635,6 +835,16 @@ async def main_async():
         "-j", "--jobs", type=int, default=1, help="Number of concurrent encoding jobs"
     )
     parser.add_argument(
+        "--end-first-chapter",
+        type=str,
+        help="Apply lower bitrate to the end portion of the first chapter: 'seconds_before,multiplier' (e.g., '30,0.5')",
+    )
+    parser.add_argument(
+        "--after-last-chapter",
+        type=str,
+        help="Apply lower bitrate after last chapter: 'multiplier' (e.g., '0.3')",
+    )
+    parser.add_argument(
         "-v", "--verbose", action="store_true", help="Enable verbose logging"
     )
 
@@ -642,9 +852,14 @@ async def main_async():
 
     setup_logging(args.verbose)
 
-    config = Config()
+    # Parse zone configuration
+    try:
+        zone_config = parse_zone_config(args.end_first_chapter, args.after_last_chapter)
+    except argparse.ArgumentTypeError as e:
+        parser.error(str(e))
+
+    config = Config(zone_config=zone_config)
     processor = BatchProcessor(config)
-    processor._setup_signal_handlers()
 
     success = await processor.process_batch(
         args.inputs, args.output_dir, args.scratch_dir, args.token_dir, args.jobs
