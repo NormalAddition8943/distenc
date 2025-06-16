@@ -477,8 +477,8 @@ class VideoEncoder:
         zones = self.zone_calculator.calculate_zones(video_info)
 
         # Build x265 parameters
-        x265_params_base = ""
-        # self.config.x265_params
+        x265_params_base = self.config.x265_params
+
         if zones:
             x265_params_base = f"zones={zones}:{x265_params_base}"
             self.logger.info(f"Using zones for {job.input_path.name}: {zones}")
@@ -501,7 +501,7 @@ class VideoEncoder:
             "-b:v",
             f"{self.config.video_bitrate_kbps}k",
             "-preset",
-            "veryfast",
+            "slower",
         ]
 
         # First pass (analysis)
