@@ -5,15 +5,11 @@ disable=broad-except,
         trailing-newlines,
         unidiomatic-typecheck,
         no-else-raise,
-        line-too-long,
         too-few-public-methods,
         no-else-return,
         missing-final-newline,
         logging-fstring-interpolation,
         fixme,
-        ungrouped-imports,
-        invalid-name,
-        consider-using-in,
         too-many-ancestors
 
 [FORMAT]

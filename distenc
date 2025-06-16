@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """
-Batch encode videos to x265 with crop detection and concurrency.
-Uses token files in a shared directory to coordinate encoding jobs.
+Batch encode videos to x265 with automatic crop detection, support
+for title and closing sequence zone rates, and job concurrency and
+multi-machine work pooling.
+
+Uses token files in a network-shared directory to coordinate work
+amung machines.
 
 Usage:
     distenc --inputs <input_files>... --output-dir <output_dir> \
             --scratch-dir <scratch_dir> --token-dir <token_dir> \
-            [--jobs <num>] [--end-first-chapter <seconds>,<multiplier>] \
-            [--after-last-chapter <multiplier>]
+            [--title-rate <seconds>,<multiplier>] \
+            [--closing-rate <seconds>,<multiplier>] \
+            [--skip-rate-for-first-episodes] \
+            [--jobs <num>]
 """
 
 import argparse
@@ -44,8 +50,9 @@ class EncodingStatus(Enum):
 class ZoneConfig:
     """Configuration for x265 zones."""
 
-    end_first_chapter: Optional[Tuple[int, float]] = None  # (seconds_before, multiplier)
-    after_last_chapter: Optional[float] = None  # multiplier
+    title_rate: Optional[Tuple[int, float]] = None  # (seconds, multiplier)
+    closing_rate: Optional[Tuple[int, float]] = None  # (seconds, multiplier)
+    skip_first_episodes: bool = False
 
 
 @dataclass
@@ -200,8 +207,11 @@ class VideoAnalyzer:
         chapters_task = self._get_chapters(path)
 
         results = await asyncio.gather(
-            duration_task, frame_rate_task, dv_task, chapters_task,
-            return_exceptions=True
+            duration_task,
+            frame_rate_task,
+            dv_task,
+            chapters_task,
+            return_exceptions=True,
         )
 
         info.duration, info.frame_rate, info.has_dolby_vision, info.chapters = results
@@ -211,7 +221,9 @@ class VideoAnalyzer:
             self.logger.warning(f"Could not get duration for {path}: {info.duration}")
             info.duration = None
         if isinstance(info.frame_rate, Exception):
-            self.logger.warning(f"Could not get frame rate for {path}: {info.frame_rate}")
+            self.logger.warning(
+                f"Could not get frame rate for {path}: {info.frame_rate}"
+            )
             info.frame_rate = None
         if isinstance(info.has_dolby_vision, Exception):
             self.logger.warning(
@@ -259,8 +271,8 @@ class VideoAnalyzer:
         frame_rate_str = result.stdout.decode().strip()
 
         # Handle fractional frame rates like "24000/1001"
-        if '/' in frame_rate_str:
-            num, den = map(int, frame_rate_str.split('/'))
+        if "/" in frame_rate_str:
+            num, den = map(int, frame_rate_str.split("/"))
             return num / den
         else:
             return float(frame_rate_str)
@@ -315,11 +327,9 @@ class VideoAnalyzer:
                 if isinstance(tags, dict):
                     title = tags.get("title") or tags.get("TITLE")
 
-                chapters.append(Chapter(
-                    start_time=start_time,
-                    end_time=end_time,
-                    title=title
-                ))
+                chapters.append(
+                    Chapter(start_time=start_time, end_time=end_time, title=title)
+                )
 
             return chapters
 
@@ -406,50 +416,72 @@ class ZoneCalculator:
 
     def calculate_zones(self, video_info: VideoInfo) -> str:
         """Calculate x265 zones parameter based on chapters and config."""
-        if not self.config.zone_config.end_first_chapter and not self.config.zone_config.after_last_chapter:
+        if (
+            not self.config.zone_config.title_rate
+            and not self.config.zone_config.closing_rate
+        ):
             return ""
 
-        if not video_info.chapters or not video_info.duration or not video_info.frame_rate:
-            self.logger.info(f"Cannot calculate zones for {video_info.path.name}: missing chapters, duration, or frame rate")
+        if (
+            self.config.zone_config.skip_first_episodes
+            and "E01" in video_info.path.name
+        ):
+            self.logger.info(
+                f"Skipping zones for {video_info.path.name}\
+                  because it's the first episode of the season"
+            )
+            return ""
+
+        if (
+            not video_info.chapters
+            or not video_info.duration
+            or not video_info.frame_rate
+        ):
+            self.logger.info(
+                f"Cannot calculate zones for {video_info.path.name}:\
+                  missing chapters, duration, or frame rate"
+            )
             return ""
 
         zones = []
 
-        # End of first chapter zone
-        if self.config.zone_config.end_first_chapter:
+        # End of first chapter zone (title sequence)
+        if self.config.zone_config.title_rate:
             first_chapter = min(video_info.chapters, key=lambda c: c.start_time)
 
             # Check if first chapter is within first 10 minutes
             if first_chapter.end_time <= 600:  # 10 minutes = 600 seconds
-                seconds_before, multiplier = self.config.zone_config.end_first_chapter
+                seconds, multiplier = self.config.zone_config.title_rate
 
                 end_time = first_chapter.end_time
-                start_time = max(0, end_time - seconds_before)
+                start_time = max(0, end_time - seconds)
 
                 start_frame = int(start_time * video_info.frame_rate)
                 end_frame = int(end_time * video_info.frame_rate)
 
                 if start_frame < end_frame:
                     zones.append(f"{start_frame},{end_frame},b={multiplier}")
-                    self.logger.info(f"Added end-first-chapter zone: frames {start_frame}-{end_frame}, multiplier {multiplier}")
+                    self.logger.info(
+                        f"Added title rate zone: frames\
+                          {start_frame}-{end_frame}, multiplier {multiplier}"
+                    )
 
-        # After last chapter zone
-        if self.config.zone_config.after_last_chapter:
-            last_chapter = max(video_info.chapters, key=lambda c: c.start_time)
+        # Closing sequence zone
+        if self.config.zone_config.closing_rate:
+            seconds, multiplier = self.config.zone_config.closing_rate
 
-            # Check if last chapter is within last 10 minutes
-            if last_chapter.start_time >= video_info.duration - 600:  # Last 10 minutes
-                multiplier = self.config.zone_config.after_last_chapter
+            end_time = video_info.duration
+            start_time = max(0, end_time - seconds)
 
-                start_time = last_chapter.start_time
-                end_time = video_info.duration
+            start_frame = int(start_time * video_info.frame_rate)
+            end_frame = int(end_time * video_info.frame_rate)
 
-                start_frame = int(start_time * video_info.frame_rate)
-                end_frame = int(end_time * video_info.frame_rate)
-
-                if start_frame < end_frame:
-                    zones.append(f"{start_frame},{end_frame},b={multiplier}")
-                    self.logger.info(f"Added after-last-chapter zone: frames {start_frame}-{end_frame}, multiplier {multiplier}")
+            if start_frame < end_frame:
+                zones.append(f"{start_frame},{end_frame},b={multiplier}")
+                self.logger.info(
+                    f"Added closing rate zone: frames\
+                      {start_frame}-{end_frame}, multiplier {multiplier}"
+                )
 
         return "/".join(zones) if zones else ""
 
@@ -593,6 +625,7 @@ class VideoEncoder:
                     Path(temp_file).unlink(missing_ok=True)
                 job.temp_path = None
 
+
 class BatchProcessor:
     """Orchestrates batch processing with proper resource management."""
 
@@ -610,7 +643,7 @@ class BatchProcessor:
         for sig in [signal.SIGINT, signal.SIGTERM]:
             signal.signal(sig, self._signal_handler)
 
-    def _signal_handler(self, signum, frame):
+    def _signal_handler(self, signum, _unused_arg):
         """Handle shutdown signals."""
         self.logger.info(f"Received signal {signum}, initiating shutdown...")
         self._shutdown_event.set()
@@ -666,7 +699,9 @@ class BatchProcessor:
 
         except FileExistsError:
             # Another process already claimed this job
-            self.logger.info(f"Job already claimed by another process: {job.input_path.name}")
+            self.logger.info(
+                f"Job already claimed by another process: {job.input_path.name}"
+            )
             return False
 
     @asynccontextmanager
@@ -681,7 +716,9 @@ class BatchProcessor:
             if job.status == EncodingStatus.FAILED and job.token_path.exists():
                 job.token_path.unlink(missing_ok=True)
 
-    async def _process_job(self, job: EncodingJob, semaphore: asyncio.Semaphore, scratch_dir: Path):
+    async def _process_job(
+        self, job: EncodingJob, semaphore: asyncio.Semaphore, scratch_dir: Path
+    ):
         """Process a single encoding job with concurrency control."""
         async with semaphore:
             if self._shutdown_event.is_set():
@@ -749,39 +786,43 @@ class BatchProcessor:
         return failed == 0
 
 
-def parse_zone_config(before_first: Optional[str], after_last: Optional[str]) -> ZoneConfig:
+def parse_zone(seconds_multiplier: Optional[str]) -> Optional[Tuple[int, float]]:
+    """Parse zone from 'seconds,multiplier' string format."""
+    if not seconds_multiplier:
+        return None
+
+    try:
+        parts = seconds_multiplier.split(",")
+        if len(parts) != 2:
+            raise ValueError(
+                "rate-scale must be in format 'seconds,multiplier' e.g:75,0.5"
+            )
+
+        seconds = int(parts[0])
+        multiplier = float(parts[1])
+
+        if seconds < 0:
+            raise ValueError("seconds before must be non-negative")
+        if multiplier <= 0:
+            raise ValueError("multiplier must be positive")
+
+        return (seconds, multiplier)
+
+    except (ValueError, IndexError) as e:
+        raise argparse.ArgumentTypeError(f"Invalid rate-scale format: {e}")
+
+
+def parse_zone_config(
+    title_rate: Optional[str],
+    closing_rate: Optional[str],
+    skip_rate_for_first_episodes: bool,
+) -> ZoneConfig:
     """Parse zone configuration from command line arguments."""
     zone_config = ZoneConfig()
 
-    if before_first:
-        try:
-            parts = before_first.split(',')
-            if len(parts) != 2:
-                raise ValueError("end-first-chapter must be in format 'seconds,multiplier'")
-
-            seconds_before = int(parts[0])
-            multiplier = float(parts[1])
-
-            if seconds_before < 0:
-                raise ValueError("seconds before must be non-negative")
-            if multiplier <= 0:
-                raise ValueError("multiplier must be positive")
-
-            zone_config.end_first_chapter = (seconds_before, multiplier)
-
-        except (ValueError, IndexError) as e:
-            raise argparse.ArgumentTypeError(f"Invalid end-first-chapter format: {e}")
-
-    if after_last:
-        try:
-            multiplier = float(after_last)
-            if multiplier <= 0:
-                raise ValueError("multiplier must be positive")
-            zone_config.after_last_chapter = multiplier
-
-        except ValueError as e:
-            raise argparse.ArgumentTypeError(f"Invalid after-last-chapter format: {e}")
-
+    zone_config.title_rate = parse_zone(title_rate)
+    zone_config.closing_rate = parse_zone(closing_rate)
+    zone_config.skip_first_episodes = skip_rate_for_first_episodes
     return zone_config
 
 
@@ -800,7 +841,8 @@ def setup_logging(verbose: bool = False):
 async def main_async():
     """Async main function."""
     parser = argparse.ArgumentParser(
-        description="Batch x265 encode with crop detection, Dolby Vision, zones, and async concurrency."
+        description="Batch x265 encode with crop detection,\
+              Dolby Vision, zones, and async concurrency."
     )
     parser.add_argument(
         "-i",
@@ -835,14 +877,21 @@ async def main_async():
         "-j", "--jobs", type=int, default=1, help="Number of concurrent encoding jobs"
     )
     parser.add_argument(
-        "--end-first-chapter",
+        "--title-rate",
         type=str,
-        help="Apply lower bitrate to the end portion of the first chapter: 'seconds_before,multiplier' (e.g., '30,0.5')",
+        help="Reduce the show's title sequence bitrate by the multiplier:\
+              'title-seconds-before-2nd-chapter,multiplier' (e.g., '75,0.5')",
     )
     parser.add_argument(
-        "--after-last-chapter",
+        "--closing-rate",
         type=str,
-        help="Apply lower bitrate after last chapter: 'multiplier' (e.g., '0.3')",
+        help="Reduce the show's closing sequence bitrate by the multiplier:\
+              'seconds,multiplier' (e.g., '15,0.1')",
+    )
+    parser.add_argument(
+        "--skip-rate-for-first-episodes",
+        action="store_true",
+        help="Skip rate multipliers for filenames containing the *E01* pattern",
     )
     parser.add_argument(
         "-v", "--verbose", action="store_true", help="Enable verbose logging"
@@ -854,7 +903,9 @@ async def main_async():
 
     # Parse zone configuration
     try:
-        zone_config = parse_zone_config(args.end_first_chapter, args.after_last_chapter)
+        zone_config = parse_zone_config(
+            args.title_rate, args.closing_rate, args.skip_rate_for_first_episodes
+        )
     except argparse.ArgumentTypeError as e:
         parser.error(str(e))
 
