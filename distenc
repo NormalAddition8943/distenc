@@ -1,140 +1,56 @@
 #!/usr/bin/env python3
 """
-Batch encode videos to x265 with automatic crop detection, support
-for title and closing sequence zone rates, job concurrency and
-multi-machine work coordination.
-
-Uses a network-shared directory to coordinate work amung machines.
-
-Usage:
-    distenc --inputs <input_files>... --output-dir <output_dir> \
-            --scratch-dir <scratch_dir> --token-dir <token_dir> \
-            [--title-rate <seconds>,<multiplier>] \
-            [--closing-rate <seconds>,<multiplier>] \
-            [--skip-rate-for-first-episodes] \
-            [--jobs <num>]
+Batch encode videos to x265 with automatic crop detection, 2-pass audio normalization,
+title/closing sequence zone rates, and job concurrency.
 """
 
-import argparse
-import asyncio
-import glob
-import json
-import logging
-import os
-import re
-import signal
-import subprocess
-import sys
-import tempfile
+import argparse, asyncio, glob, json, logging, os, re, signal, subprocess, sys, tempfile, traceback, time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from shutil import which
 from typing import Dict, List, Optional, Tuple, AsyncGenerator
-import time
-
 
 class EncodingStatus(Enum):
-    """Status of encoding jobs."""
-
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
     FAILED = "failed"
     SKIPPED = "skipped"
 
-
-@dataclass
-class ZoneConfig:
-    """Configuration for x265 zones."""
-
-    title_rate: Optional[Tuple[int, float]] = None  # (seconds, multiplier)
-    closing_rate: Optional[Tuple[int, float]] = None  # (seconds, multiplier)
-    skip_first_episodes: bool = False
-
-
-@dataclass
-class Chapter:
-    """Represents a video chapter."""
-
-    start_time: float  # in seconds
-    end_time: Optional[float] = None
-    title: Optional[str] = None
-
-
 @dataclass
 class Config:
-    """Configuration for video encoding."""
-
-    # Video settings
     target_width: str = "-2"
     target_height: str = "720"
     video_bitrate_kbps: int = 800
     audio_bitrate_kbps: int = 80
     crop_samples: int = 5
-
-    # Tool paths
     ffmpeg_path: str = "ffmpeg"
     ffprobe_path: str = "ffprobe"
-
-    # x265 encoding parameters
     x265_params: str = (
-        "hme=1:hme-search=hex,hex,umh:hme-range=25,25,26:subme=5:"
-        "min-keyint=24:keyint=800:cbqpoffs=-3:crqpoffs=-3:rc-lookahead=48:"
-        "aq-mode=4:aq-strength=1.0:aq-motion=1:qcomp=0.65:bframes=6:ref=4:"
-        "rd=4:dynamic-rd=4:psy-rd=1.8:psy-rdoq=1.0:deblock=-3:"
-        "tskip=1:tskip-fast=1:frame-threads=2:limit-sao=1:selective-sao=1:"
-        "no-amp=1:no-rect=1:no-high-tier=1:hdr10-opt=1:vbv-maxrate=8000:vbv-bufsize=12000"
+        "hme=1:hme-search=hex,hex,umh:hme-range=25,25,26:subme=5:min-keyint=24:"
+        "keyint=800:cbqpoffs=-3:crqpoffs=-3:rc-lookahead=48:aq-mode=4:aq-strength=1.0:"
+        "aq-motion=1:qcomp=0.65:bframes=6:ref=4:rd=4:dynamic-rd=4:psy-rd=1.8:"
+        "psy-rdoq=1.0:deblock=-3:tskip=1:tskip-fast=1:frame-threads=2:limit-sao=1:"
+        "selective-sao=1:no-amp=1:no-rect=1:no-high-tier=1:hdr10-opt=1:"
+        "vbv-maxrate=8000:vbv-bufsize=12000"
     )
-
-    # Audio processing
-    audio_filter: str = "dynaudnorm=threshold=-40dB,loudnorm=I=-15:TP=-1.0:LRA=12"
-
-    # Zone configuration
-    zone_config: ZoneConfig = field(default_factory=ZoneConfig)
-
-    @property
-    def detect_filter(self) -> str:
-        """Filter for crop detection."""
-        return f"scale={self.target_width}:{self.target_height},cropdetect=round=2"
-
-
-@dataclass
-class CropParameters:
-    """Crop detection results."""
-
-    width: int
-    height: int
-    x: int
-    y: int
-
-    def to_filter_string(self, config: Config) -> str:
-        """Convert to FFmpeg filter string."""
-        return (
-            f"zscale={config.target_width}:{config.target_height}:"
-            f"filter=spline36:param_a=5,"
-            f"crop={self.width}:{self.height}:{self.x}:{self.y},"
-            f"cas=strength=0.13"
-        )
-
+    title_rate: Optional[Tuple[int, float]] = None
+    closing_rate: Optional[Tuple[int, float]] = None
+    skip_first_episodes: bool = False
 
 @dataclass
 class VideoInfo:
-    """Information about a video file."""
-
     path: Path
     duration: Optional[float] = None
     frame_rate: Optional[float] = None
-    has_dolby_vision: Optional[bool] = None
-    crop_params: Optional[CropParameters] = None
-    chapters: List[Chapter] = field(default_factory=list)
-
+    has_dolby_vision: bool = False
+    crop_params: Optional[Tuple[int, int, int, int]] = None
+    chapters: List[Tuple[float, Optional[float]]] = field(default_factory=list)
 
 @dataclass
 class EncodingJob:
-    """Represents a single encoding job."""
-
     input_path: Path
     output_path: Path
     token_path: Path
@@ -144,789 +60,388 @@ class EncodingJob:
     end_time: Optional[float] = None
     error_message: Optional[str] = None
 
-    @property
-    def duration(self) -> Optional[float]:
-        """Get job duration if completed."""
-        if self.start_time and self.end_time:
-            return self.end_time - self.start_time
-        return None
-
-
 class FFmpegError(Exception):
-    """Custom exception for FFmpeg-related errors."""
+    print(traceback.format_exc())
+    pass
 
-
-class VideoAnalyzer:
-    """Analyzes video files for encoding parameters."""
-
+class VideoProcessor:
     def __init__(self, config: Config):
         self.config = config
         self.logger = logging.getLogger(__name__)
 
-    async def _run_command(
-        self, cmd: List[str], timeout: int = 300
-    ) -> subprocess.CompletedProcess:
-        """Run command asynchronously with timeout."""
+    async def _run_cmd(self, cmd: List[str], timeout: int = 300) -> subprocess.CompletedProcess:
         try:
             process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                stdin=asyncio.subprocess.DEVNULL,
-                env={**os.environ, "TERM": "dumb"},
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.DEVNULL, env={**os.environ, "TERM": "dumb"}
             )
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=timeout
-            )
-
-            # Create a CompletedProcess-like object
-            result = subprocess.CompletedProcess(
-                cmd, process.returncode, stdout, stderr
-            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+            result = subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
             if result.returncode != 0:
-                raise FFmpegError(
-                    f"Command failed: {' '.join(cmd)}\nStderr: {stderr.decode()}"
-                )
+                raise FFmpegError(f"Command failed: {' '.join(cmd)}\n{stderr.decode()}")
             return result
-
         except asyncio.TimeoutError:
             if process:
                 process.terminate()
                 await process.wait()
-            raise FFmpegError(f"Command timed out after {timeout}s: {' '.join(cmd)}")
+            raise FFmpegError(f"Command timed out: {' '.join(cmd)}")
 
     async def get_video_info(self, path: Path) -> VideoInfo:
-        """Get comprehensive video information."""
         info = VideoInfo(path)
 
-        # Get all info in parallel
-        duration_task = self._get_duration(path)
-        frame_rate_task = self._get_frame_rate(path)
-        dv_task = self._has_dolby_vision(path)
-        chapters_task = self._get_chapters(path)
-
-        results = await asyncio.gather(
-            duration_task,
-            frame_rate_task,
-            dv_task,
-            chapters_task,
-            return_exceptions=True,
-        )
-
-        info.duration, info.frame_rate, info.has_dolby_vision, info.chapters = results
-
-        # Handle exceptions
-        if isinstance(info.duration, Exception):
-            self.logger.warning(f"Could not get duration for {path}: {info.duration}")
-            info.duration = None
-        if isinstance(info.frame_rate, Exception):
-            self.logger.warning(
-                f"Could not get frame rate for {path}: {info.frame_rate}"
-            )
-            info.frame_rate = None
-        if isinstance(info.has_dolby_vision, Exception):
-            self.logger.warning(
-                f"Could not check Dolby Vision for {path}: {info.has_dolby_vision}"
-            )
-            info.has_dolby_vision = False
-        if isinstance(info.chapters, Exception):
-            self.logger.warning(f"Could not get chapters for {path}: {info.chapters}")
-            info.chapters = []
-
-        return info
-
-    async def _get_duration(self, path: Path) -> float:
-        """Get video duration in seconds."""
-        cmd = [
-            self.config.ffprobe_path,
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            str(path),
-        ]
-        result = await self._run_command(cmd)
-        return float(result.stdout.decode().strip())
-
-    async def _get_frame_rate(self, path: Path) -> float:
-        """Get video frame rate."""
-        cmd = [
-            self.config.ffprobe_path,
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=r_frame_rate",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            str(path),
-        ]
-        result = await self._run_command(cmd)
-        frame_rate_str = result.stdout.decode().strip()
-
-        # Handle fractional frame rates like "24000/1001"
-        if "/" in frame_rate_str:
-            num, den = map(int, frame_rate_str.split("/"))
-            return num / den
-        else:
-            return float(frame_rate_str)
-
-    async def _has_dolby_vision(self, path: Path) -> bool:
-        """Check if video has Dolby Vision metadata."""
-        cmd = [
-            self.config.ffprobe_path,
-            "-v",
-            "quiet",
-            "-select_streams",
-            "v:0",
-            "-show_streams",
-            "-print_format",
-            "json",
-            str(path),
-        ]
-        result = await self._run_command(cmd)
-        data = json.loads(result.stdout.decode())
-        stream = data.get("streams", [{}])[0]
-        side_data_list = stream.get("side_data_list", [])
-        return any(
-            sd.get("side_data_type") == "DOVI configuration record"
-            for sd in side_data_list
-        )
-
-    async def _get_chapters(self, path: Path) -> List[Chapter]:
-        """Get chapter information from the video."""
-        cmd = [
-            self.config.ffprobe_path,
-            "-v",
-            "quiet",
-            "-show_chapters",
-            "-print_format",
-            "json",
-            str(path),
-        ]
-
+        # Get duration
         try:
-            result = await self._run_command(cmd)
-            data = json.loads(result.stdout.decode())
-            chapters = []
+            result = await self._run_cmd([
+                self.config.ffprobe_path, "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)
+            ])
+            info.duration = float(result.stdout.decode().strip())
+        except: pass
 
+        # Get frame rate
+        try:
+            result = await self._run_cmd([
+                self.config.ffprobe_path, "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=r_frame_rate", "-of", "default=noprint_wrappers=1:nokey=1", str(path)
+            ])
+            frame_rate_str = result.stdout.decode().strip()
+            if "/" in frame_rate_str:
+                num, den = map(int, frame_rate_str.split("/"))
+                info.frame_rate = num / den
+            else:
+                info.frame_rate = float(frame_rate_str)
+        except: pass
+
+        # Check Dolby Vision
+        try:
+            result = await self._run_cmd([
+                self.config.ffprobe_path, "-v", "quiet", "-select_streams", "v:0",
+                "-show_streams", "-print_format", "json", str(path)
+            ])
+            data = json.loads(result.stdout.decode())
+            stream = data.get("streams", [{}])[0]
+            side_data_list = stream.get("side_data_list", [])
+            info.has_dolby_vision = any(
+                sd.get("side_data_type") == "DOVI configuration record" for sd in side_data_list
+            )
+        except: pass
+
+        # Get chapters
+        try:
+            result = await self._run_cmd([
+                self.config.ffprobe_path, "-v", "quiet", "-show_chapters", "-print_format", "json", str(path)
+            ])
+            data = json.loads(result.stdout.decode())
             for chapter_data in data.get("chapters", []):
                 start_time = float(chapter_data.get("start_time", 0))
                 end_time = chapter_data.get("end_time")
-                if end_time is not None:
-                    end_time = float(end_time)
+                if end_time is not None: end_time = float(end_time)
+                info.chapters.append((start_time, end_time))
+        except: pass
 
-                title = None
-                tags = chapter_data.get("tags", {})
-                if isinstance(tags, dict):
-                    title = tags.get("title") or tags.get("TITLE")
+        return info
 
-                chapters.append(
-                    Chapter(start_time=start_time, end_time=end_time, title=title)
-                )
-
-            return chapters
-
-        except (FFmpegError, json.JSONDecodeError, KeyError):
-            return []
-
-    async def _detect_crop_at_timestamp(
-        self, path: Path, timestamp: float
-    ) -> Optional[Tuple[int, int, int, int]]:
-        """Detect crop parameters at a specific timestamp."""
-        cmd = [
-            self.config.ffmpeg_path,
-            "-hide_banner",
-            "-ss",
-            f"{timestamp:.3f}",
-            "-i",
-            str(path),
-            "-frames:v",
-            "5",
-            "-vf",
-            self.config.detect_filter,
-            "-f",
-            "null",
-            "/dev/null" if os.name != "nt" else "NUL",
-        ]
-
-        try:
-            result = await self._run_command(cmd, timeout=60)
-        except FFmpegError:
-            return None
-
-        stderr = result.stderr.decode(errors="ignore")
-        matches = re.findall(r"crop=(\d+):(\d+):(\d+):(\d+)", stderr)
-        return tuple(map(int, matches[-1])) if matches else None
-
-    async def detect_crop_parameters(self, video_info: VideoInfo) -> CropParameters:
-        """Detect optimal crop parameters by sampling multiple timestamps."""
+    async def detect_crop(self, video_info: VideoInfo) -> Tuple[int, int, int, int]:
         if not video_info.duration:
-            raise FFmpegError("Cannot detect crop without video duration")
+            raise FFmpegError("Cannot detect crop without duration")
 
         interval = video_info.duration / self.config.crop_samples
-        timestamps = [i * interval for i in range(self.config.crop_samples)]
+        crops = []
 
-        # Detect crops at all timestamps concurrently
-        crop_tasks = [
-            self._detect_crop_at_timestamp(video_info.path, ts) for ts in timestamps
-        ]
-        crop_results = await asyncio.gather(*crop_tasks, return_exceptions=True)
+        for i in range(self.config.crop_samples):
+            timestamp = i * interval
+            try:
+                result = await self._run_cmd([
+                    self.config.ffmpeg_path, "-hide_banner", "-ss", f"{timestamp:.3f}",
+                    "-i", str(video_info.path), "-frames:v", "5", "-vf",
+                    f"scale={self.config.target_width}:{self.config.target_height},cropdetect=round=2",
+                    "-f", "null", "/dev/null" if os.name != "nt" else "NUL"
+                ], timeout=60)
+                matches = re.findall(r"crop=(\d+):(\d+):(\d+):(\d+)", result.stderr.decode())
+                if matches: crops.append(tuple(map(int, matches[-1])))
+            except: pass
 
-        # Process results
-        valid_crops = [
-            result
-            for result in crop_results
-            if not isinstance(result, Exception) and result is not None
-        ]
-
-        if not valid_crops:
-            raise FFmpegError("No crop parameters detected")
+        if not crops: raise FFmpegError("No crop parameters detected")
 
         # Find bounding box
-        min_x = min(crop[2] for crop in valid_crops)  # x offset
-        min_y = min(crop[3] for crop in valid_crops)  # y offset
-        max_x = max(crop[2] + crop[0] for crop in valid_crops)  # x + width
-        max_y = max(crop[3] + crop[1] for crop in valid_crops)  # y + height
+        min_x = min(crop[2] for crop in crops)
+        min_y = min(crop[3] for crop in crops)
+        max_x = max(crop[2] + crop[0] for crop in crops)
+        max_y = max(crop[3] + crop[1] for crop in crops)
 
-        crop_params = CropParameters(
-            width=max_x - min_x, height=max_y - min_y, x=min_x, y=min_y
-        )
-
-        self.logger.info(
-            f"Detected crop {crop_params.width}:{crop_params.height}:"
-            f"{crop_params.x}:{crop_params.y} for {video_info.path.name}"
-        )
-
-        return crop_params
-
-
-class ZoneCalculator:
-    """Calculates x265 zones based on chapters and configuration."""
-
-    def __init__(self, config: Config):
-        self.config = config
-        self.logger = logging.getLogger(__name__)
+        return (max_x - min_x, max_y - min_y, min_x, min_y)
 
     def calculate_zones(self, video_info: VideoInfo) -> str:
-        """Calculate x265 zones parameter based on chapters and config."""
-        if (
-            not self.config.zone_config.title_rate
-            and not self.config.zone_config.closing_rate
-        ):
-            return ""
-
-        if (
-            self.config.zone_config.skip_first_episodes
-            and "E01" in video_info.path.name
-        ):
-            self.logger.info(
-                f"Skipping zones for {video_info.path.name}\
-                  because it's the first episode of the season"
-            )
-            return ""
-
-        if (
-            not video_info.chapters
-            or not video_info.duration
-            or not video_info.frame_rate
-        ):
-            self.logger.info(
-                f"Cannot calculate zones for {video_info.path.name}:\
-                  missing chapters, duration, or frame rate"
-            )
-            return ""
+        if not self.config.title_rate and not self.config.closing_rate: return ""
+        if self.config.skip_first_episodes and "E01" in video_info.path.name: return ""
+        if not video_info.chapters or not video_info.duration or not video_info.frame_rate: return ""
 
         zones = []
 
-        # End of first chapter zone (title sequence)
-        if self.config.zone_config.title_rate:
-            first_chapter = min(video_info.chapters, key=lambda c: c.start_time)
-
-            # Check if first chapter is within first 10 minutes
-            if first_chapter.end_time <= 600:  # 10 minutes = 600 seconds
-                seconds, multiplier = self.config.zone_config.title_rate
-
-                end_time = first_chapter.end_time
+        # Title sequence zone
+        if self.config.title_rate:
+            first_chapter = min(video_info.chapters, key=lambda c: c[0])
+            if first_chapter[1] and first_chapter[1] <= 600:  # 10 minutes
+                seconds, multiplier = self.config.title_rate
+                end_time = first_chapter[1]
                 start_time = max(0, end_time - seconds)
-
                 start_frame = int(start_time * video_info.frame_rate)
                 end_frame = int(end_time * video_info.frame_rate)
-
                 if start_frame < end_frame:
                     zones.append(f"{start_frame},{end_frame},b={multiplier}")
-                    self.logger.info(
-                        f"Added title rate zone: frames\
-                          {start_frame}-{end_frame}, multiplier {multiplier}"
-                    )
 
         # Closing sequence zone
-        if self.config.zone_config.closing_rate:
-            seconds, multiplier = self.config.zone_config.closing_rate
-
+        if self.config.closing_rate:
+            seconds, multiplier = self.config.closing_rate
             end_time = video_info.duration
             start_time = max(0, end_time - seconds)
-
             start_frame = int(start_time * video_info.frame_rate)
             end_frame = int(end_time * video_info.frame_rate)
-
             if start_frame < end_frame:
                 zones.append(f"{start_frame},{end_frame},b={multiplier}")
-                self.logger.info(
-                    f"Added closing rate zone: frames\
-                      {start_frame}-{end_frame}, multiplier {multiplier}"
-                )
 
-        return "/".join(zones) if zones else ""
-
-
-class VideoEncoder:
-    """Handles video encoding operations."""
-
-    def __init__(self, config: Config, analyzer: VideoAnalyzer):
-        self.config = config
-        self.analyzer = analyzer
-        self.zone_calculator = ZoneCalculator(config)
-        self.logger = logging.getLogger(__name__)
-
-    def _build_encoding_commands(
-        self, job: EncodingJob, video_info: VideoInfo
-    ) -> Tuple[List[str], List[str]]:
-        """Build the two-pass encoding commands."""
-        vf_filter = video_info.crop_params.to_filter_string(self.config)
-        dolby_vision_flag = "1" if video_info.has_dolby_vision else "0"
-
-        assert job.temp_path is not None
-        stats_path = job.temp_path.with_suffix(".stats")
-
-        # Calculate zones
-        zones = self.zone_calculator.calculate_zones(video_info)
-
-        # Build x265 parameters
-        x265_params_base = self.config.x265_params
-
-        if zones:
-            x265_params_base = f"zones={zones}:{x265_params_base}"
-            self.logger.info(f"Using zones for {job.input_path.name}: {zones}")
-
-        base_cmd = [
-            self.config.ffmpeg_path,
-            "-hide_banner",
-            "-stats",
-            "-y",
-            "-i",
-            str(job.input_path),
-            "-vf",
-            vf_filter,
-            "-dolbyvision",
-            dolby_vision_flag,
-            "-c:v",
-            "libx265",
-            "-pix_fmt",
-            "yuv420p10le",
-            "-b:v",
-            f"{self.config.video_bitrate_kbps}k",
-            "-preset",
-            "slower",
-        ]
-
-        # First pass (analysis)
-        first_pass = base_cmd + [
-            "-x265-params",
-            f"pass=1:stats={stats_path}:no-slow-firstpass=1:{x265_params_base}",
-            "-an",
-            "-f",
-            "null",
-            "/dev/null" if os.name != "nt" else "NUL",
-        ]
-
-        # Second pass (final encode)
-        second_pass = base_cmd + [
-            "-x265-params",
-            f"pass=2:stats={stats_path}:{x265_params_base}",
-            "-filter:a",
-            self.config.audio_filter,
-            "-ac",
-            "2",
-            "-c:a",
-            "libopus",
-            "-b:a",
-            f"{self.config.audio_bitrate_kbps}k",
-            "-frame_duration",
-            "60",
-            str(job.output_path),
-        ]
-
-        return first_pass, second_pass
-
-    async def _run_encoding_pass(
-        self, cmd: List[str], job: EncodingJob, pass_name: str
-    ):
-        """Run a single encoding pass with logging."""
-        self.logger.info(f"Starting {pass_name} for {job.input_path.name}")
-
-        with job.token_path.open("a") as log_file:
-            process = await asyncio.create_subprocess_exec(
-                *cmd, stdout=log_file, stderr=log_file, stdin=asyncio.subprocess.DEVNULL
-            )
-            await process.wait()
-
-        if process.returncode != 0:
-            raise FFmpegError(f"{pass_name} failed with code {process.returncode}")
+        return "/".join(zones)
 
     async def encode_video(self, job: EncodingJob) -> None:
-        """Perform complete video encoding."""
         job.start_time = time.time()
         job.status = EncodingStatus.IN_PROGRESS
 
         try:
             # Analyze video
-            video_info = await self.analyzer.get_video_info(job.input_path)
+            video_info = await self.get_video_info(job.input_path)
             if not video_info.duration:
                 raise FFmpegError("Could not determine video duration")
 
-            # Detect crop parameters
-            video_info.crop_params = await self.analyzer.detect_crop_parameters(
-                video_info
-            )
+            video_info.crop_params = await self.detect_crop(video_info)
+            crop_w, crop_h, crop_x, crop_y = video_info.crop_params
 
-            # Build encoding commands
-            first_pass, second_pass = self._build_encoding_commands(job, video_info)
+            # Build filter and x265 params
+            vf_filter = (f"zscale={self.config.target_width}:{self.config.target_height}:"
+                        f"filter=spline36:param_a=5,crop={crop_w}:{crop_h}:{crop_x}:{crop_y},"
+                        f"cas=strength=0.13")
 
-            # Execute two-pass encoding
-            await self._run_encoding_pass(first_pass, job, "first pass")
-            await self._run_encoding_pass(second_pass, job, "second pass")
+            zones = self.calculate_zones(video_info)
+            x265_params = self.config.x265_params
+            if zones: x265_params = f"zones={zones}:{x265_params}"
+
+            stats_path = job.temp_path.with_suffix(".stats")
+
+            # First pass: video analysis + audio loudnorm analysis
+            first_pass = [
+                self.config.ffmpeg_path, "-hide_banner", "-y", "-i", str(job.input_path),
+                "-vf", vf_filter, "-dolbyvision", "1" if video_info.has_dolby_vision else "0",
+                "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-b:v", f"{self.config.video_bitrate_kbps}k",
+                "-preset", "slower", "-x265-params", f"pass=1:stats={stats_path}:no-slow-firstpass=1:{x265_params}",
+                "-map", "0:v:0", "-f", "null", "/dev/null" if os.name != "nt" else "NUL",
+                "-map", "0:a:0", "-af", "loudnorm=I=-23:TP=-2.0:LRA=7:print_format=json",
+                "-f", "null", "-"
+            ]
+
+            # Run first pass and capture loudnorm JSON
+            with job.token_path.open("w") as log_file:
+                process = await asyncio.create_subprocess_exec(
+                    *first_pass, stdout=log_file, stderr=log_file,
+                    stdin=asyncio.subprocess.DEVNULL
+                )
+                await process.wait()
+
+                if process.returncode != 0:
+                    raise FFmpegError(f"First pass failed with code {process.returncode}")
+
+            # Extract loudnorm measurements from stderr
+            loudnorm_data = {}
+            with job.token_path.open("r") as log_file:
+                for line in log_file:
+                    if '"input_i"' in line: loudnorm_data['measured_I'] = re.search(r'"input_i"\s*:\s*"([^"]*)"', line).group(1)
+                    elif '"input_tp"' in line: loudnorm_data['measured_TP'] = re.search(r'"input_tp"\s*:\s*"([^"]*)"', line).group(1)
+                    elif '"input_lra"' in line: loudnorm_data['measured_LRA'] = re.search(r'"input_lra"\s*:\s*"([^"]*)"', line).group(1)
+                    elif '"input_thresh"' in line: loudnorm_data['measured_thresh'] = re.search(r'"input_thresh"\s*:\s*"([^"]*)"', line).group(1)
+                    elif '"target_offset"' in line: loudnorm_data['offset'] = re.search(r'"target_offset"\s*:\s*"([^"]*)"', line).group(1)
+
+            # Second pass: final encode with measured loudnorm values
+            loudnorm_filter = (f"loudnorm=I=-23:TP=-2.0:LRA=7:"
+                             f"measured_I={loudnorm_data.get('measured_I', '-23')}:"
+                             f"measured_TP={loudnorm_data.get('measured_TP', '-2.0')}:"
+                             f"measured_LRA={loudnorm_data.get('measured_LRA', '7')}:"
+                             f"measured_thresh={loudnorm_data.get('measured_thresh', '-33')}:"
+                             f"offset={loudnorm_data.get('offset', '0.0')}")
+
+            second_pass = [
+                self.config.ffmpeg_path, "-hide_banner", "-stats", "-y", "-i", str(job.input_path),
+                "-vf", vf_filter, "-dolbyvision", "1" if video_info.has_dolby_vision else "0",
+                "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-b:v", f"{self.config.video_bitrate_kbps}k",
+                "-preset", "slower", "-x265-params", f"pass=2:stats={stats_path}:{x265_params}",
+                "-filter:a", loudnorm_filter, "-ac", "2", "-c:a", "libopus",
+                "-b:a", f"{self.config.audio_bitrate_kbps}k", "-frame_duration", "60",
+                str(job.output_path)
+            ]
+
+            with job.token_path.open("a") as log_file:
+                process = await asyncio.create_subprocess_exec(
+                    *second_pass, stdout=log_file, stderr=log_file, stdin=asyncio.subprocess.DEVNULL
+                )
+                await process.wait()
+
+            if process.returncode != 0:
+                raise FFmpegError(f"Second pass failed with code {process.returncode}")
 
             job.status = EncodingStatus.COMPLETED
             self.logger.info(f"Encoding completed: {job.input_path.name}")
 
         except Exception as e:
+            print(traceback.format_exc())
             job.status = EncodingStatus.FAILED
             job.error_message = str(e)
             self.logger.error(f"Encoding failed for {job.input_path.name}: {e}")
-
-            # Cleanup failed output
             job.output_path.unlink(missing_ok=True)
             if job.token_path.exists():
                 job.token_path.rename(job.token_path.with_suffix(".error_log"))
-
         finally:
             job.end_time = time.time()
-
-            # Cleanup temporary files
             if job.temp_path:
                 for temp_file in glob.glob(str(job.temp_path) + "*"):
                     Path(temp_file).unlink(missing_ok=True)
                 job.temp_path = None
 
-
 class BatchProcessor:
-    """Orchestrates batch processing with proper resource management."""
-
     def __init__(self, config: Config):
         self.config = config
-        self.analyzer = VideoAnalyzer(config)
-        self.encoder = VideoEncoder(config, self.analyzer)
+        self.processor = VideoProcessor(config)
         self.logger = logging.getLogger(__name__)
         self._shutdown_event = asyncio.Event()
         self._active_jobs: Dict[Path, EncodingJob] = {}
         self._setup_signal_handlers()
 
     def _setup_signal_handlers(self):
-        """Setup graceful shutdown signal handlers."""
         for sig in [signal.SIGINT, signal.SIGTERM]:
             signal.signal(sig, self._signal_handler)
 
-    def _signal_handler(self, signum, _unused_arg):
-        """Handle shutdown signals."""
-        self.logger.info(f"Received signal {signum}, initiating shutdown...")
+    def _signal_handler(self, signum, _):
+        self.logger.info(f"Received signal {signum}, shutting down...")
         self._shutdown_event.set()
 
     def _check_dependencies(self) -> bool:
-        """Verify required tools are available."""
-        missing_tools = []
-        for tool in [self.config.ffmpeg_path, self.config.ffprobe_path]:
-            if not which(tool):
-                missing_tools.append(tool)
-                self.logger.error(f"Required tool not found: {tool}")
-
-        if missing_tools:
-            self.logger.error("Please install missing tools and ensure they're in PATH")
+        missing = [tool for tool in [self.config.ffmpeg_path, self.config.ffprobe_path] if not which(tool)]
+        if missing:
+            self.logger.error(f"Missing tools: {missing}")
             return False
-
         return True
 
-    def _create_job_template(
-        self, input_path: Path, output_dir: Path, token_dir: Path
-    ) -> EncodingJob:
-        """Create a job template without claiming it yet."""
-        token_path = (token_dir / input_path.name).with_suffix(".token")
-        output_path = output_dir / input_path.name
-
-        return EncodingJob(
-            input_path=input_path,
-            output_path=output_path,
-            token_path=token_path,
-        )
-
     def _try_claim_job(self, job: EncodingJob, scratch_dir: Path) -> bool:
-        """Try to claim a job by creating its token. Returns True if successfully claimed."""
-        # Check if already processed
         if job.output_path.exists():
-            self.logger.info(f"Output already exists: {job.output_path.name}")
-            # Create token to mark as done
             job.token_path.touch()
             return False
-
-        # Try to claim the job atomically
         try:
-            # Use exclusive creation to prevent race conditions
             with job.token_path.open("x") as f:
                 f.write(f"Claimed by PID {os.getpid()} at {time.time()}\n")
-
-            # Create temporary file now that we've claimed the job
             with tempfile.NamedTemporaryFile(dir=scratch_dir, delete=False) as tmp:
                 job.temp_path = Path(tmp.name)
-
-            self.logger.info(f"Successfully claimed job: {job.input_path.name}")
             return True
-
         except FileExistsError:
-            # Another process already claimed this job
-            self.logger.info(
-                f"Job already claimed by another process: {job.input_path.name}"
-            )
             return False
 
     @asynccontextmanager
     async def _job_context(self, job: EncodingJob) -> AsyncGenerator[EncodingJob, None]:
-        """Context manager for job lifecycle."""
         self._active_jobs[job.input_path] = job
         try:
             yield job
         finally:
             self._active_jobs.pop(job.input_path, None)
-            # Cleanup token on failure
             if job.status == EncodingStatus.FAILED and job.token_path.exists():
                 job.token_path.unlink(missing_ok=True)
 
-    async def _process_job(
-        self, job: EncodingJob, semaphore: asyncio.Semaphore, scratch_dir: Path
-    ):
-        """Process a single encoding job with concurrency control."""
+    async def _process_job(self, job: EncodingJob, semaphore: asyncio.Semaphore, scratch_dir: Path):
         async with semaphore:
             if self._shutdown_event.is_set():
                 job.status = EncodingStatus.SKIPPED
                 return
-
-            # Try to claim the job just before processing
             if not self._try_claim_job(job, scratch_dir):
                 job.status = EncodingStatus.SKIPPED
                 return
-
             async with self._job_context(job):
-                await self.encoder.encode_video(job)
+                await self.processor.encode_video(job)
 
-    async def process_batch(
-        self,
-        input_files: List[Path],
-        output_dir: Path,
-        scratch_dir: Path,
-        token_dir: Path,
-        max_workers: int = 1,
-    ) -> bool:
-        """Process batch of video files asynchronously."""
-        if not self._check_dependencies():
-            return False
+    async def process_batch(self, input_files: List[Path], output_dir: Path,
+                          scratch_dir: Path, token_dir: Path, max_workers: int = 1) -> bool:
+        if not self._check_dependencies(): return False
 
-        # Create directories
         for directory in [output_dir, scratch_dir, token_dir]:
             directory.mkdir(parents=True, exist_ok=True)
 
-        # Create job templates (don't claim them yet)
         jobs = []
         for input_file in input_files:
-            if not input_file.is_file():
-                self.logger.warning(f"Skipping non-file: {input_file}")
-                continue
-
-            job = self._create_job_template(input_file, output_dir, token_dir)
-            jobs.append(job)
+            if input_file.is_file():
+                token_path = (token_dir / input_file.name).with_suffix(".token")
+                output_path = output_dir / input_file.name
+                jobs.append(EncodingJob(input_file, output_path, token_path))
 
         if not jobs:
             self.logger.info("No jobs to process")
             return True
 
-        self.logger.info(f"Found {len(jobs)} potential jobs with {max_workers} workers")
-
-        # Process jobs with concurrency control
+        self.logger.info(f"Processing {len(jobs)} jobs with {max_workers} workers")
         semaphore = asyncio.Semaphore(max_workers)
         tasks = [self._process_job(job, semaphore, scratch_dir) for job in jobs]
 
         try:
             await asyncio.gather(*tasks)
         except KeyboardInterrupt:
-            self.logger.info("Processing interrupted by user")
+            self.logger.info("Processing interrupted")
             self._shutdown_event.set()
 
-        # Report results
         completed = sum(1 for job in jobs if job.status == EncodingStatus.COMPLETED)
         failed = sum(1 for job in jobs if job.status == EncodingStatus.FAILED)
         skipped = sum(1 for job in jobs if job.status == EncodingStatus.SKIPPED)
-
-        self.logger.info(
-            f"Batch complete: {completed} succeeded, {failed} failed, {skipped} skipped"
-        )
+        self.logger.info(f"Complete: {completed} succeeded, {failed} failed, {skipped} skipped")
         return failed == 0
 
-
-def parse_zone(seconds_multiplier: Optional[str]) -> Optional[Tuple[int, float]]:
-    """Parse zone from 'seconds,multiplier' string format."""
-    if not seconds_multiplier:
-        return None
-
+def parse_zone(s: Optional[str]) -> Optional[Tuple[int, float]]:
+    if not s: return None
     try:
-        parts = seconds_multiplier.split(",")
-        if len(parts) != 2:
-            raise ValueError(
-                "rate-scale must be in format 'seconds,multiplier' e.g:75,0.5"
-            )
-
-        seconds = int(parts[0])
-        multiplier = float(parts[1])
-
-        if seconds < 0:
-            raise ValueError("seconds before must be non-negative")
-        if multiplier <= 0:
-            raise ValueError("multiplier must be positive")
-
+        parts = s.split(",")
+        if len(parts) != 2: raise ValueError("Format: 'seconds,multiplier'")
+        seconds, multiplier = int(parts[0]), float(parts[1])
+        if seconds < 0 or multiplier <= 0: raise ValueError("Invalid values")
         return (seconds, multiplier)
-
     except (ValueError, IndexError) as e:
-        raise argparse.ArgumentTypeError(f"Invalid rate-scale format: {e}")
-
-
-def parse_zone_config(
-    title_rate: Optional[str],
-    closing_rate: Optional[str],
-    skip_rate_for_first_episodes: bool,
-) -> ZoneConfig:
-    """Parse zone configuration from command line arguments."""
-    zone_config = ZoneConfig()
-
-    zone_config.title_rate = parse_zone(title_rate)
-    zone_config.closing_rate = parse_zone(closing_rate)
-    zone_config.skip_first_episodes = skip_rate_for_first_episodes
-    return zone_config
-
-
-def setup_logging(verbose: bool = False):
-    """Setup logging configuration."""
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-        ],
-    )
-
+        raise argparse.ArgumentTypeError(f"Invalid format: {e}")
 
 async def main_async():
-    """Async main function."""
-    parser = argparse.ArgumentParser(
-        description="Batch x265 encode with crop detection,\
-              Dolby Vision, zones, and async concurrency."
-    )
-    parser.add_argument(
-        "-i",
-        "--inputs",
-        nargs="+",
-        type=Path,
-        required=True,
-        help="Input video files to encode",
-    )
-    parser.add_argument(
-        "-o",
-        "--output-dir",
-        type=Path,
-        required=True,
-        help="Directory for encoded output files",
-    )
-    parser.add_argument(
-        "-s",
-        "--scratch-dir",
-        type=Path,
-        required=True,
-        help="Directory for temporary files during encoding",
-    )
-    parser.add_argument(
-        "-t",
-        "--token-dir",
-        type=Path,
-        required=True,
-        help="Directory for coordination token files",
-    )
-    parser.add_argument(
-        "-j", "--jobs", type=int, default=1, help="Number of concurrent encoding jobs"
-    )
-    parser.add_argument(
-        "--title-rate",
-        type=str,
-        help="Reduce the show's title sequence bitrate by the multiplier:\
-              'title-seconds-before-2nd-chapter,multiplier' (e.g., '75,0.5')",
-    )
-    parser.add_argument(
-        "--closing-rate",
-        type=str,
-        help="Reduce the show's closing sequence bitrate by the multiplier:\
-              'seconds,multiplier' (e.g., '15,0.1')",
-    )
-    parser.add_argument(
-        "--skip-rate-for-first-episodes",
-        action="store_true",
-        help="Skip rate multipliers for filenames containing the *E01* pattern",
-    )
-    parser.add_argument(
-        "-v", "--verbose", action="store_true", help="Enable verbose logging"
-    )
+    parser = argparse.ArgumentParser(description="Batch x265 encode with crop detection and 2-pass audio normalization")
+    parser.add_argument("-i", "--inputs", nargs="+", type=Path, required=True, help="Input video files")
+    parser.add_argument("-o", "--output-dir", type=Path, required=True, help="Output directory")
+    parser.add_argument("-s", "--scratch-dir", type=Path, required=True, help="Temp directory")
+    parser.add_argument("-t", "--token-dir", type=Path, required=True, help="Token directory")
+    parser.add_argument("-j", "--jobs", type=int, default=1, help="Concurrent jobs")
+    parser.add_argument("--title-rate", type=str, help="Title sequence rate 'seconds,multiplier'")
+    parser.add_argument("--closing-rate", type=str, help="Closing sequence rate 'seconds,multiplier'")
+    parser.add_argument("--skip-rate-for-first-episodes", action="store_true", help="Skip rates for E01 episodes")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
 
     args = parser.parse_args()
 
-    setup_logging(args.verbose)
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                       format="%(asctime)s - %(levelname)s - %(message)s")
 
-    # Parse zone configuration
     try:
-        zone_config = parse_zone_config(
-            args.title_rate, args.closing_rate, args.skip_rate_for_first_episodes
+        config = Config(
+            title_rate=parse_zone(args.title_rate),
+            closing_rate=parse_zone(args.closing_rate),
+            skip_first_episodes=args.skip_rate_for_first_episodes
         )
     except argparse.ArgumentTypeError as e:
         parser.error(str(e))
 
-    config = Config(zone_config=zone_config)
     processor = BatchProcessor(config)
-
-    success = await processor.process_batch(
-        args.inputs, args.output_dir, args.scratch_dir, args.token_dir, args.jobs
-    )
-
+    success = await processor.process_batch(args.inputs, args.output_dir, args.scratch_dir, args.token_dir, args.jobs)
     return 0 if success else 1
 
-
 def main():
-    """Main entry point."""
     try:
-        exit_code = asyncio.run(main_async())
-        sys.exit(exit_code)
+        sys.exit(asyncio.run(main_async()))
     except KeyboardInterrupt:
-        print("\nInterrupted by user")
+        print("\nInterrupted")
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
