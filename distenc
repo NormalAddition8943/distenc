@@ -28,6 +28,7 @@ class Config:
     crop_samples: int = 5
     ffmpeg_path: str = "ffmpeg"
     ffprobe_path: str = "ffprobe"
+
     x265_params: str = (
         "hme=1:hme-search=hex,hex,umh:hme-range=25,25,26:subme=5:min-keyint=24:"
         "keyint=800:cbqpoffs=-3:crqpoffs=-3:rc-lookahead=48:aq-mode=4:aq-strength=1.0:"
@@ -36,9 +37,20 @@ class Config:
         "selective-sao=1:no-amp=1:no-rect=1:no-high-tier=1:hdr10-opt=1:"
         "vbv-maxrate=8000:vbv-bufsize=12000"
     )
+
+    one_pass_x265_params: str = (
+        "hme=1:hme-search=hex,hex,umh:hme-range=25,25,26:subme=5:min-keyint=24:"
+        "keyint=800:cbqpoffs=-3:crqpoffs=-3:rc-lookahead=250:aq-mode=4:aq-strength=1.0:"
+        "aq-motion=1:bframes=6:ref=4:rd=4:dynamic-rd=4:psy-rd=1.8:"
+        "psy-rdoq=5:deblock=6:qcomp=0.65:tskip=1:tskip-fast=1:frame-threads=1:mcstf=1:limit-sao=1:"
+        "nr-inter=50:selective-sao=2:no-amp=1:no-rect=1:no-high-tier=1:hdr10-opt=1:"
+        "vbv-maxrate=4000:vbv-bufsize=8000:qpmax=33"
+    )
+
     title_rate: Optional[Tuple[int, float]] = None
     closing_rate: Optional[Tuple[int, float]] = None
     skip_first_episodes: bool = False
+    one_pass: bool = False
 
 @dataclass
 class VideoInfo:
@@ -215,78 +227,110 @@ class VideoProcessor:
             video_info.crop_params = await self.detect_crop(video_info)
             crop_w, crop_h, crop_x, crop_y = video_info.crop_params
 
-            # Build filter and x265 params
+            # Build video filter
             vf_filter = (f"zscale={self.config.target_width}:{self.config.target_height}:"
-                        f"filter=spline36:param_a=5,crop={crop_w}:{crop_h}:{crop_x}:{crop_y},"
-                        f"cas=strength=0.13")
+                         f"filter=spline36:param_a=5,crop={crop_w}:{crop_h}:{crop_x}:{crop_y},"
+                         f"cas=strength=0.13")
 
             zones = self.calculate_zones(video_info)
-            x265_params = self.config.x265_params
-            if zones: x265_params = f"zones={zones}:{x265_params}"
 
-            stats_path = job.temp_path.with_suffix(".stats")
+            if self.config.one_pass:
+                x265_params = self.config.one_pass_x265_params
+                if zones:
+                    x265_params = f"zones={zones}:{x265_params}"
 
-            # First pass: video analysis + audio loudnorm analysis
-            first_pass = [
-                self.config.ffmpeg_path, "-hide_banner", "-y", "-i", str(job.input_path),
-                "-vf", vf_filter, "-dolbyvision", "1" if video_info.has_dolby_vision else "0",
-                "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-b:v", f"{self.config.video_bitrate_kbps}k",
-                "-preset", "slower", "-x265-params", f"pass=1:stats={stats_path}:no-slow-firstpass=1:{x265_params}",
-                "-map", "0:v:0", "-f", "null", "/dev/null" if os.name != "nt" else "NUL",
-                "-map", "0:a:0", "-af", "loudnorm=I=-23:TP=-2.0:LRA=7:print_format=json",
-                "-f", "null", "-"
-            ]
+                vf_filter = vf_filter.replace(",cas=strength=0.13", "")
+                loudnorm_filter = "loudnorm=I=-23:TP=-2.0:LRA=7"
 
-            # Run first pass and capture loudnorm JSON
-            with job.token_path.open("w") as log_file:
-                process = await asyncio.create_subprocess_exec(
-                    *first_pass, stdout=log_file, stderr=log_file,
-                    stdin=asyncio.subprocess.DEVNULL
-                )
-                await process.wait()
+                # Single-pass FFmpeg command
+                one_pass_cmd = [
+                    self.config.ffmpeg_path, "-hide_banner", "-stats", "-y", "-i", str(job.input_path),
+                    "-vf", vf_filter, "-dolbyvision", "1" if video_info.has_dolby_vision else "0",
+                    "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-b:v", f"{self.config.video_bitrate_kbps}k",
+                    "-preset", "slower", "-x265-params", x265_params,
+                    "-filter:a", loudnorm_filter, "-ac", "2", "-c:a", "libopus",
+                    "-b:a", f"{self.config.audio_bitrate_kbps}k", "-frame_duration", "60",
+                    str(job.output_path)
+                ]
+
+                with job.token_path.open("w") as log_file:
+                    process = await asyncio.create_subprocess_exec(
+                        *one_pass_cmd, stdout=log_file, stderr=log_file, stdin=asyncio.subprocess.DEVNULL
+                    )
+                    await process.wait()
+
+                if process.returncode != 0:
+                    raise FFmpegError(f"One-pass encoding failed with code {process.returncode}")
+
+                job.status = EncodingStatus.COMPLETED
+                self.logger.info(f"One-pass encoding completed: {job.input_path.name}")
+
+            else:
+                # Two-pass encoding (original logic)
+                x265_params = self.config.x265_params
+                if zones:
+                    x265_params = f"zones={zones}:{x265_params}"
+                stats_path = job.temp_path.with_suffix(".stats")
+
+                # First pass
+                first_pass = [
+                    self.config.ffmpeg_path, "-hide_banner", "-y", "-i", str(job.input_path),
+                    "-vf", vf_filter, "-dolbyvision", "1" if video_info.has_dolby_vision else "0",
+                    "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-b:v", f"{self.config.video_bitrate_kbps}k",
+                    "-preset", "slower", "-x265-params", f"pass=1:stats={stats_path}:no-slow-firstpass=1:{x265_params}",
+                    "-map", "0:v:0", "-f", "null", "/dev/null" if os.name != "nt" else "NUL",
+                    "-map", "0:a:0", "-af", "loudnorm=I=-23:TP=-2.0:LRA=7:print_format=json",
+                    "-f", "null", "-"
+                ]
+
+                with job.token_path.open("w") as log_file:
+                    process = await asyncio.create_subprocess_exec(
+                        *first_pass, stdout=log_file, stderr=log_file, stdin=asyncio.subprocess.DEVNULL
+                    )
+                    await process.wait()
 
                 if process.returncode != 0:
                     raise FFmpegError(f"First pass failed with code {process.returncode}")
 
-            # Extract loudnorm measurements from stderr
-            loudnorm_data = {}
-            with job.token_path.open("r") as log_file:
-                for line in log_file:
-                    if '"input_i"' in line: loudnorm_data['measured_I'] = re.search(r'"input_i"\s*:\s*"([^"]*)"', line).group(1)
-                    elif '"input_tp"' in line: loudnorm_data['measured_TP'] = re.search(r'"input_tp"\s*:\s*"([^"]*)"', line).group(1)
-                    elif '"input_lra"' in line: loudnorm_data['measured_LRA'] = re.search(r'"input_lra"\s*:\s*"([^"]*)"', line).group(1)
-                    elif '"input_thresh"' in line: loudnorm_data['measured_thresh'] = re.search(r'"input_thresh"\s*:\s*"([^"]*)"', line).group(1)
-                    elif '"target_offset"' in line: loudnorm_data['offset'] = re.search(r'"target_offset"\s*:\s*"([^"]*)"', line).group(1)
+                # Extract loudnorm measurements
+                loudnorm_data = {}
+                with job.token_path.open("r") as log_file:
+                    for line in log_file:
+                        if '"input_i"' in line: loudnorm_data['measured_I'] = re.search(r'"input_i"\s*:\s*"([^"]*)"', line).group(1)
+                        elif '"input_tp"' in line: loudnorm_data['measured_TP'] = re.search(r'"input_tp"\s*:\s*"([^"]*)"', line).group(1)
+                        elif '"input_lra"' in line: loudnorm_data['measured_LRA'] = re.search(r'"input_lra"\s*:\s*"([^"]*)"', line).group(1)
+                        elif '"input_thresh"' in line: loudnorm_data['measured_thresh'] = re.search(r'"input_thresh"\s*:\s*"([^"]*)"', line).group(1)
+                        elif '"target_offset"' in line: loudnorm_data['offset'] = re.search(r'"target_offset"\s*:\s*"([^"]*)"', line).group(1)
 
-            # Second pass: final encode with measured loudnorm values
-            loudnorm_filter = (f"loudnorm=I=-23:TP=-2.0:LRA=7:"
-                             f"measured_I={loudnorm_data.get('measured_I', '-23')}:"
-                             f"measured_TP={loudnorm_data.get('measured_TP', '-2.0')}:"
-                             f"measured_LRA={loudnorm_data.get('measured_LRA', '7')}:"
-                             f"measured_thresh={loudnorm_data.get('measured_thresh', '-33')}:"
-                             f"offset={loudnorm_data.get('offset', '0.0')}")
+                # Second pass
+                loudnorm_filter = (f"loudnorm=I=-23:TP=-2.0:LRA=7:"
+                                 f"measured_I={loudnorm_data.get('measured_I', '-23')}:"
+                                 f"measured_TP={loudnorm_data.get('measured_TP', '-2.0')}:"
+                                 f"measured_LRA={loudnorm_data.get('measured_LRA', '7')}:"
+                                 f"measured_thresh={loudnorm_data.get('measured_thresh', '-33')}:"
+                                 f"offset={loudnorm_data.get('offset', '0.0')}")
 
-            second_pass = [
-                self.config.ffmpeg_path, "-hide_banner", "-stats", "-y", "-i", str(job.input_path),
-                "-vf", vf_filter, "-dolbyvision", "1" if video_info.has_dolby_vision else "0",
-                "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-b:v", f"{self.config.video_bitrate_kbps}k",
-                "-preset", "slower", "-x265-params", f"pass=2:stats={stats_path}:{x265_params}",
-                "-filter:a", loudnorm_filter, "-ac", "2", "-c:a", "libopus",
-                "-b:a", f"{self.config.audio_bitrate_kbps}k", "-frame_duration", "60",
-                str(job.output_path)
-            ]
+                second_pass = [
+                    self.config.ffmpeg_path, "-hide_banner", "-stats", "-y", "-i", str(job.input_path),
+                    "-vf", vf_filter, "-dolbyvision", "1" if video_info.has_dolby_vision else "0",
+                    "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-b:v", f"{self.config.video_bitrate_kbps}k",
+                    "-preset", "slower", "-x265-params", f"pass=2:stats={stats_path}:{x265_params}",
+                    "-filter:a", loudnorm_filter, "-ac", "2", "-c:a", "libopus",
+                    "-b:a", f"{self.config.audio_bitrate_kbps}k", "-frame_duration", "60",
+                    str(job.output_path)
+                ]
 
-            with job.token_path.open("a") as log_file:
-                process = await asyncio.create_subprocess_exec(
-                    *second_pass, stdout=log_file, stderr=log_file, stdin=asyncio.subprocess.DEVNULL
-                )
-                await process.wait()
+                with job.token_path.open("a") as log_file:
+                    process = await asyncio.create_subprocess_exec(
+                        *second_pass, stdout=log_file, stderr=log_file, stdin=asyncio.subprocess.DEVNULL
+                    )
+                    await process.wait()
 
-            if process.returncode != 0:
-                raise FFmpegError(f"Second pass failed with code {process.returncode}")
+                if process.returncode != 0:
+                    raise FFmpegError(f"Second pass failed with code {process.returncode}")
 
-            job.status = EncodingStatus.COMPLETED
-            self.logger.info(f"Encoding completed: {job.input_path.name}")
+                job.status = EncodingStatus.COMPLETED
+                self.logger.info(f"Two-pass encoding completed: {job.input_path.name}")
 
         except Exception as e:
             print(traceback.format_exc())
@@ -416,6 +460,7 @@ async def main_async():
     parser.add_argument("--title-rate", type=str, help="Title sequence rate 'seconds,multiplier'")
     parser.add_argument("--closing-rate", type=str, help="Closing sequence rate 'seconds,multiplier'")
     parser.add_argument("--skip-rate-for-first-episodes", action="store_true", help="Skip rates for E01 episodes")
+    parser.add_argument("--one-pass", action="store_true", help="Use one-pass Motion-compensated spatio-temporal filtering")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
 
     args = parser.parse_args()
@@ -427,7 +472,8 @@ async def main_async():
         config = Config(
             title_rate=parse_zone(args.title_rate),
             closing_rate=parse_zone(args.closing_rate),
-            skip_first_episodes=args.skip_rate_for_first_episodes
+            skip_first_episodes=args.skip_rate_for_first_episodes,
+            one_pass=args.one_pass
         )
     except argparse.ArgumentTypeError as e:
         parser.error(str(e))
