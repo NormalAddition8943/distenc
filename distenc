@@ -40,7 +40,7 @@ class Config:
 
     one_pass_x265_params: str = (
         "hme=1:hme-search=hex,hex,umh:hme-range=25,25,26:subme=5:min-keyint=24:"
-        "keyint=800:cbqpoffs=-3:crqpoffs=-3:rc-lookahead=250:aq-mode=4:aq-strength=1.0:"
+        "keyint=800:cbqpoffs=-3:crqpoffs=-3:rc-lookahead=120:aq-mode=4:aq-strength=1.0:"
         "aq-motion=1:bframes=6:ref=4:rd=4:dynamic-rd=4:psy-rd=1.8:"
         "psy-rdoq=5:deblock=6:qcomp=0.65:tskip=1:tskip-fast=1:frame-threads=1:mcstf=1:limit-sao=1:"
         "nr-inter=50:selective-sao=2:no-amp=1:no-rect=1:no-high-tier=1:hdr10-opt=1:"
@@ -85,7 +85,7 @@ class VideoProcessor:
         try:
             process = await asyncio.create_subprocess_exec(
                 *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                stdin=asyncio.subprocess.DEVNULL, env={**os.environ, "TERM": "dumb"}
+                stdin=asyncio.subprocess.DEVNULL, env={**os.environ, "TERM": "dumb", "MALLOC_ARENA_MAX": "1"}
             )
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
             result = subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
