@@ -24,6 +24,7 @@ class Config:
     target_width: str = "-2"
     target_height: str = "720"
     video_bitrate_kbps: int = 800
+    one_pass_video_crf: int = 18
     audio_bitrate_kbps: int = 80
     crop_samples: int = 5
     ffmpeg_path: str = "ffmpeg"
@@ -39,12 +40,12 @@ class Config:
     )
 
     one_pass_x265_params: str = (
-        "hme=1:hme-search=hex,hex,umh:hme-range=25,25,26:subme=5:min-keyint=24:"
-        "keyint=800:cbqpoffs=-3:crqpoffs=-3:rc-lookahead=120:aq-mode=4:aq-strength=1.0:"
-        "aq-motion=1:bframes=6:ref=4:rd=4:dynamic-rd=4:psy-rd=1.8:"
-        "psy-rdoq=5:deblock=6:qcomp=0.65:tskip=1:tskip-fast=1:frame-threads=1:mcstf=1:limit-sao=1:"
-        "nr-inter=50:selective-sao=2:no-amp=1:no-rect=1:no-high-tier=1:hdr10-opt=1:"
-        "vbv-maxrate=4000:vbv-bufsize=8000:qpmax=33"
+        "hme=1:hme-search=hex,hex,umh:hme-range=25,25,26:subme=7:min-keyint=24:"
+        "keyint=800:cbqpoffs=-3:crqpoffs=-3:aq-mode=4:hevc-aq=1:qg-size=16:aq-strength=1.0:"
+        "aq-motion=1:bframes=12:ref=4:rd=4:dynamic-rd=4:psy-rd=1.8:psy-rdoq=3:"
+        "deblock=6:qcomp=0.65:tskip=1:tskip-fast=1:frame-threads=1:mcstf=1:limit-sao=1:"
+        "nr-inter=100:selective-sao=2:no-amp=1:no-rect=1:no-high-tier=1:hdr10-opt=1:"
+        "vbv-maxrate=1200:vbv-bufsize=1500"
     )
 
     title_rate: Optional[Tuple[int, float]] = None
@@ -230,7 +231,7 @@ class VideoProcessor:
             # Build video filter
             vf_filter = (f"zscale={self.config.target_width}:{self.config.target_height}:"
                          f"filter=spline36:param_a=5,crop={crop_w}:{crop_h}:{crop_x}:{crop_y},"
-                         f"cas=strength=0.13")
+                         f"cas=strength=0.15")
 
             zones = self.calculate_zones(video_info)
 
@@ -239,14 +240,13 @@ class VideoProcessor:
                 if zones:
                     x265_params = f"zones={zones}:{x265_params}"
 
-                vf_filter = vf_filter.replace(",cas=strength=0.13", "")
                 loudnorm_filter = "loudnorm=I=-23:TP=-2.0:LRA=7"
 
                 # Single-pass FFmpeg command
                 one_pass_cmd = [
                     self.config.ffmpeg_path, "-hide_banner", "-stats", "-y", "-i", str(job.input_path),
                     "-vf", vf_filter, "-dolbyvision", "1" if video_info.has_dolby_vision else "0",
-                    "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-b:v", f"{self.config.video_bitrate_kbps}k",
+                    "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-crf", f"{self.config.one_pass_video_crf}",
                     "-preset", "slower", "-x265-params", x265_params,
                     "-filter:a", loudnorm_filter, "-ac", "2", "-c:a", "libopus",
                     "-b:a", f"{self.config.audio_bitrate_kbps}k", "-frame_duration", "60",
