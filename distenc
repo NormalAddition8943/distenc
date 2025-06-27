@@ -31,12 +31,12 @@ class Config:
     ffprobe_path: str = "ffprobe"
 
     x265_params: str = (
-        "hme=1:hme-search=hex,hex,umh:hme-range=25,25,26:subme=5:min-keyint=24:"
-        "keyint=800:cbqpoffs=-3:crqpoffs=-3:rc-lookahead=48:aq-mode=4:aq-strength=1.0:"
-        "aq-motion=1:qcomp=0.65:bframes=6:ref=4:rd=4:dynamic-rd=4:psy-rd=1.8:"
+        "hme=1:hme-search=hex,hex,umh:hme-range=25,25,26:subme=7:min-keyint=24:"
+        "keyint=800:cbqpoffs=-3:crqpoffs=-3:aq-mode=4:hevc-aq=1:aq-strength=1.0:"
+        "aq-motion=1:qcomp=0.65:bframes=8:ref=4:rd=4:dynamic-rd=4:psy-rd=1.8:"
         "psy-rdoq=1.0:deblock=-3:tskip=1:tskip-fast=1:frame-threads=2:limit-sao=1:"
-        "selective-sao=1:no-amp=1:no-rect=1:no-high-tier=1:hdr10-opt=1:"
-        "vbv-maxrate=8000:vbv-bufsize=12000"
+        "selective-sao=2:amp=1:no-rect=1:no-high-tier=1:hdr10-opt=1:"
+        "vbv-maxrate=1600:vbv-bufsize=2400"
     )
 
     one_pass_x265_params: str = (
