@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Batch encode videos to x265 with automatic crop detection, 2-pass audio normalization,
-title/closing sequence zone rates, and job concurrency.
+title/closing sequence zone rates, grain presets, and job concurrency.
 """
 
 import argparse, asyncio, glob, json, logging, os, re, signal, subprocess, sys, tempfile, traceback, time
@@ -19,39 +19,50 @@ class EncodingStatus(Enum):
     FAILED = "failed"
     SKIPPED = "skipped"
 
+class GrainLevel(Enum):
+    NONE = "none"
+    LIGHT = "light"
+    MEDIUM = "medium"
+    HEAVY = "heavy"
+
 @dataclass
 class Config:
     target_width: str = "-2"
     target_height: str = "720"
     video_bitrate_kbps: int = 800
-    one_pass_video_crf: int = 18
     audio_bitrate_kbps: int = 80
     crop_samples: int = 5
     ffmpeg_path: str = "ffmpeg"
     ffprobe_path: str = "ffprobe"
+    grain_level: GrainLevel = GrainLevel.NONE
 
     x265_params: str = (
-        "hme=1:hme-search=hex,hex,umh:hme-range=25,25,26:subme=7:min-keyint=24:"
-        "keyint=800:cbqpoffs=-3:crqpoffs=-3:aq-mode=4:hevc-aq=1:aq-strength=1.0:"
-        "aq-motion=1:qcomp=0.65:bframes=8:ref=4:rd=4:dynamic-rd=4:psy-rd=1.8:"
-        "psy-rdoq=1.0:deblock=-3:tskip=1:tskip-fast=1:frame-threads=1:limit-sao=1:"
-        "selective-sao=2:amp=1:no-rect=1:no-high-tier=1:hdr10-opt=1:"
-        "vbv-maxrate=1600:vbv-bufsize=2400"
-    )
-
-    one_pass_x265_params: str = (
-        "hme=1:hme-search=hex,hex,umh:hme-range=25,25,26:subme=7:min-keyint=24:"
-        "keyint=800:cbqpoffs=-3:crqpoffs=-3:aq-mode=4:hevc-aq=1:qg-size=16:aq-strength=1.0:"
-        "aq-motion=1:bframes=12:ref=4:rd=4:dynamic-rd=4:psy-rd=1.8:psy-rdoq=3:"
-        "deblock=6:qcomp=0.65:tskip=1:tskip-fast=1:frame-threads=1:mcstf=1:limit-sao=1:"
-        "nr-inter=100:selective-sao=2:no-amp=1:no-rect=1:no-high-tier=1:hdr10-opt=1:"
-        "vbv-maxrate=1200:vbv-bufsize=1500"
+        "hme=1:hme-search=hex,hex,umh:hme-range=25,25,26:subme=7:min-keyint=48:"
+        "keyint=800:aq-mode=4:aq-strength=1.0:"
+        "aq-motion=1:qcomp=0.65:ref=4:rd=4:dynamic-rd=4:psy-rd=1.8:"
+        "psy-rdoq=1.0:tskip=1:tskip-fast=1:no-rect=1:frame-threads=1:limit-sao=1:"
+        "no-high-tier=1:hdr10-opt=1:"
     )
 
     title_rate: Optional[Tuple[int, float]] = None
     closing_rate: Optional[Tuple[int, float]] = None
     skip_first_episodes: bool = False
     one_pass: bool = False
+
+    def get_encoding_params(self) -> Tuple[bool, int, str, str, str]:
+        """Returns (use_one_pass, crf_or_rate, x265_params, scale_filter, sharpen_filter)"""
+        if self.grain_level == GrainLevel.LIGHT:
+            light_params = self.x265_params + "bframes=6:cbqpoffs=-1:crqpoffs=-1:deblock=2:no-amp=1:selective-sao=4:rc-lookahead=160:vbv-maxrate=10000:vbv-bufsize=12000:"
+            return False, 1200, light_params, "spline36", None
+        elif self.grain_level == GrainLevel.MEDIUM:
+            medium_params = self.x265_params + "bframes=5:cbqpoffs=1:crqpoffs=1:deblock=4:no-amp=1:selective-sao=5:nr-inter=200:nr-intra=50:rc-lookahead=160:vbv-maxrate=5000:vbv-bufsize=6000:"
+            return False, 1000, medium_params, "spline36", None
+        elif self.grain_level == GrainLevel.HEAVY:
+            heavy_params = self.x265_params + "hevc-aq=1:mcstf=1:bframes=5:cbqpoffs=3:crqpoffs=3:deblock=6:no-amp=1:nr-inter=1000:nr-intra=400:rc-lookahead=60:vbv-maxrate=2500:vbv-bufsize=3000:"
+            return True, 33, heavy_params, "lanczos", None
+
+        base_params = self.x265_params + "bframes=7:cbqpoffs=-3:crqpoffs=-3:deblock=-3:selective-sao=3:rc-lookahead=160:vbv-maxrate=10000:vbv-bufsize=12000:"
+        return False, 800, base_params, "spline36", "cas=strength=0.15"
 
 @dataclass
 class VideoInfo:
@@ -61,6 +72,7 @@ class VideoInfo:
     has_dolby_vision: bool = False
     crop_params: Optional[Tuple[int, int, int, int]] = None
     chapters: List[Tuple[float, Optional[float]]] = field(default_factory=list)
+    text_subtitle_streams: List[int] = field(default_factory=list)
 
 @dataclass
 class EncodingJob:
@@ -152,6 +164,20 @@ class VideoProcessor:
                 info.chapters.append((start_time, end_time))
         except: pass
 
+        # Detect text-based subtitle streams
+        try:
+            result = await self._run_cmd([
+                self.config.ffprobe_path, "-v", "quiet", "-show_streams",
+                "-select_streams", "s", "-print_format", "json", str(path)
+            ])
+            data = json.loads(result.stdout.decode())
+            for i, stream in enumerate(data.get("streams", [])):
+                codec_name = stream.get("codec_name", "").lower()
+                # Include text-based subtitle formats
+                if codec_name in ["subrip", "ass", "ssa", "webvtt", "srt", "mov_text", "text"]:
+                    info.text_subtitle_streams.append(i)
+        except: pass
+
         return info
 
     async def detect_crop(self, video_info: VideoInfo) -> Tuple[int, int, int, int]:
@@ -215,6 +241,18 @@ class VideoProcessor:
 
         return "/".join(zones)
 
+    def build_subtitle_mapping(self, video_info: VideoInfo) -> List[str]:
+        """Build subtitle stream mapping arguments for text-based subtitles only"""
+        subtitle_args = []
+        for stream_idx in video_info.text_subtitle_streams:
+            subtitle_args.extend(["-map", f"0:s:{stream_idx}"])
+
+        # Add subtitle codec if we have text subtitles
+        if video_info.text_subtitle_streams:
+            subtitle_args.extend(["-c:s", "copy"])
+
+        return subtitle_args
+
     async def encode_video(self, job: EncodingJob) -> None:
         job.start_time = time.time()
         job.status = EncodingStatus.IN_PROGRESS
@@ -228,30 +266,48 @@ class VideoProcessor:
             video_info.crop_params = await self.detect_crop(video_info)
             crop_w, crop_h, crop_x, crop_y = video_info.crop_params
 
+            # Get encoding parameters based on grain level
+            use_one_pass, crf_or_rate, x265_params, scale_filter, sharpen_filter = self.config.get_encoding_params()
+
             # Build video filter
-            vf_filter = (f"zscale={self.config.target_width}:{self.config.target_height}:"
-                         f"filter=spline36:param_a=5,crop={crop_w}:{crop_h}:{crop_x}:{crop_y},"
-                         f"cas=strength=0.15")
+            vf_parts = [
+                f"zscale={self.config.target_width}:{self.config.target_height}:filter={scale_filter}",
+                f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}"
+            ]
+            if sharpen_filter:
+                vf_parts.append(sharpen_filter)
+
+            vf_filter = ",".join(vf_parts)
 
             zones = self.calculate_zones(video_info)
 
-            if self.config.one_pass:
-                x265_params = self.config.one_pass_x265_params
+            # Build subtitle mapping
+            subtitle_args = self.build_subtitle_mapping(video_info)
+
+            if use_one_pass or self.config.one_pass:
+                # Adjust x265 params with zones if present
+                final_x265_params = x265_params
                 if zones:
-                    x265_params = f"zones={zones}:{x265_params}"
+                    final_x265_params = f"zones={zones}:{x265_params}"
 
                 loudnorm_filter = "loudnorm=I=-23:TP=-2.0:LRA=7"
 
                 # Single-pass FFmpeg command
                 one_pass_cmd = [
                     self.config.ffmpeg_path, "-hide_banner", "-stats", "-y", "-i", str(job.input_path),
+                    # Map video and audio streams explicitly
+                    "-map", "0:v:0",  # Map first video stream
+                    "-map", "0:a:0",  # Map first audio stream
                     "-vf", vf_filter, "-dolbyvision", "1" if video_info.has_dolby_vision else "0",
-                    "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-crf", f"{self.config.one_pass_video_crf}",
-                    "-preset", "slower", "-x265-params", x265_params,
+                    "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-crf", f"{crf_or_rate}",
+                    "-preset", "slower", "-x265-params", final_x265_params,
                     "-filter:a", loudnorm_filter, "-ac", "2", "-c:a", "libopus",
-                    "-b:a", f"{self.config.audio_bitrate_kbps}k", "-frame_duration", "60",
-                    str(job.output_path)
+                    "-b:a", f"{self.config.audio_bitrate_kbps}k", "-frame_duration", "60"
                 ]
+
+                # Add subtitle mappings
+                one_pass_cmd.extend(subtitle_args)
+                one_pass_cmd.append(str(job.output_path))
 
                 with job.token_path.open("w") as log_file:
                     process = await asyncio.create_subprocess_exec(
@@ -266,18 +322,18 @@ class VideoProcessor:
                 self.logger.info(f"One-pass encoding completed: {job.input_path.name}")
 
             else:
-                # Two-pass encoding (original logic)
-                x265_params = self.config.x265_params
+                # Two-pass encoding
+                final_x265_params = x265_params
                 if zones:
-                    x265_params = f"zones={zones}:{x265_params}"
+                    final_x265_params = f"zones={zones}:{x265_params}"
                 stats_path = job.temp_path.with_suffix(".stats")
 
                 # First pass
                 first_pass = [
                     self.config.ffmpeg_path, "-hide_banner", "-y", "-i", str(job.input_path),
                     "-vf", vf_filter, "-dolbyvision", "1" if video_info.has_dolby_vision else "0",
-                    "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-b:v", f"{self.config.video_bitrate_kbps}k",
-                    "-preset", "slower", "-x265-params", f"pass=1:stats={stats_path}:no-slow-firstpass=1:{x265_params}",
+                    "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-b:v", f"{crf_or_rate}k",
+                    "-preset", "slower", "-x265-params", f"pass=1:stats={stats_path}:no-slow-firstpass=1:{final_x265_params}",
                     "-map", "0:v:0", "-f", "null", "/dev/null" if os.name != "nt" else "NUL",
                     "-map", "0:a:0", "-af", "loudnorm=I=-23:TP=-2.0:LRA=7:print_format=json",
                     "-f", "null", "-"
@@ -312,13 +368,19 @@ class VideoProcessor:
 
                 second_pass = [
                     self.config.ffmpeg_path, "-hide_banner", "-stats", "-y", "-i", str(job.input_path),
+                    # Map video and audio streams explicitly
+                    "-map", "0:v:0",  # Map first video stream
+                    "-map", "0:a:0",  # Map first audio stream
                     "-vf", vf_filter, "-dolbyvision", "1" if video_info.has_dolby_vision else "0",
-                    "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-b:v", f"{self.config.video_bitrate_kbps}k",
-                    "-preset", "slower", "-x265-params", f"pass=2:stats={stats_path}:{x265_params}",
+                    "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-b:v", f"{crf_or_rate}k",
+                    "-preset", "slower", "-x265-params", f"pass=2:stats={stats_path}:{final_x265_params}",
                     "-filter:a", loudnorm_filter, "-ac", "2", "-c:a", "libopus",
-                    "-b:a", f"{self.config.audio_bitrate_kbps}k", "-frame_duration", "60",
-                    str(job.output_path)
+                    "-b:a", f"{self.config.audio_bitrate_kbps}k", "-frame_duration", "60"
                 ]
+
+                # Add subtitle mappings
+                second_pass.extend(subtitle_args)
+                second_pass.append(str(job.output_path))
 
                 with job.token_path.open("a") as log_file:
                     process = await asyncio.create_subprocess_exec(
@@ -423,7 +485,7 @@ class BatchProcessor:
             self.logger.info("No jobs to process")
             return True
 
-        self.logger.info(f"Processing {len(jobs)} jobs with {max_workers} workers")
+        self.logger.info(f"Processing {len(jobs)} jobs with {max_workers} workers using grain level: {self.config.grain_level.value}")
         semaphore = asyncio.Semaphore(max_workers)
         tasks = [self._process_job(job, semaphore, scratch_dir) for job in jobs]
 
@@ -451,7 +513,7 @@ def parse_zone(s: Optional[str]) -> Optional[Tuple[int, float]]:
         raise argparse.ArgumentTypeError(f"Invalid format: {e}")
 
 async def main_async():
-    parser = argparse.ArgumentParser(description="Batch x265 encode with crop detection and 2-pass audio normalization")
+    parser = argparse.ArgumentParser(description="Batch x265 encode with crop detection, 2-pass audio normalization, and grain control")
     parser.add_argument("-i", "--inputs", nargs="+", type=Path, required=True, help="Input video files")
     parser.add_argument("-o", "--output-dir", type=Path, required=True, help="Output directory")
     parser.add_argument("-s", "--scratch-dir", type=Path, required=True, help="Temp directory")
@@ -460,7 +522,9 @@ async def main_async():
     parser.add_argument("--title-rate", type=str, help="Title sequence rate 'seconds,multiplier'")
     parser.add_argument("--closing-rate", type=str, help="Closing sequence rate 'seconds,multiplier'")
     parser.add_argument("--skip-rate-for-first-episodes", action="store_true", help="Skip rates for E01 episodes")
-    parser.add_argument("--one-pass", action="store_true", help="Use one-pass Motion-compensated spatio-temporal filtering")
+    parser.add_argument("--one-pass", action="store_true", help="Use one-pass processing")
+    parser.add_argument("--grain", choices=["none", "light", "medium", "heavy"], default="none",
+                       help="Grain/noise reduction level (default: none)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
 
     args = parser.parse_args()
@@ -473,7 +537,8 @@ async def main_async():
             title_rate=parse_zone(args.title_rate),
             closing_rate=parse_zone(args.closing_rate),
             skip_first_episodes=args.skip_rate_for_first_episodes,
-            one_pass=args.one_pass
+            one_pass=args.one_pass,
+            grain_level=GrainLevel(args.grain)
         )
     except argparse.ArgumentTypeError as e:
         parser.error(str(e))
