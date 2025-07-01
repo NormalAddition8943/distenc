@@ -55,14 +55,14 @@ class Config:
             light_params = self.x265_params + "bframes=6:cbqpoffs=-1:crqpoffs=-1:deblock=2:no-amp=1:selective-sao=4:rc-lookahead=160:vbv-maxrate=10000:vbv-bufsize=12000:"
             return False, 1200, light_params, "spline36", None
         elif self.grain_level == GrainLevel.MEDIUM:
-            medium_params = self.x265_params + "bframes=5:cbqpoffs=1:crqpoffs=1:deblock=4:no-amp=1:selective-sao=5:nr-inter=200:nr-intra=50:rc-lookahead=160:vbv-maxrate=5000:vbv-bufsize=6000:"
+            medium_params = self.x265_params + "bframes=5:cbqpoffs=1:crqpoffs=1:deblock=4:no-amp=1:selective-sao=4:nr-inter=200:nr-intra=50:rc-lookahead=160:vbv-maxrate=5000:vbv-bufsize=6000:"
             return False, 1000, medium_params, "spline36", None
         elif self.grain_level == GrainLevel.HEAVY:
-            heavy_params = self.x265_params + "hevc-aq=1:mcstf=1:bframes=5:cbqpoffs=3:crqpoffs=3:deblock=6:no-amp=1:nr-inter=1000:nr-intra=400:rc-lookahead=60:vbv-maxrate=2500:vbv-bufsize=3000:"
+            heavy_params = self.x265_params + "hevc-aq=1:mcstf=1:bframes=5:cbqpoffs=3:crqpoffs=3:deblock=6:no-amp=1:selective-sao=4:nr-inter=1000:nr-intra=400:rc-lookahead=50:vbv-maxrate=2500:vbv-bufsize=3000:"
             return True, 33, heavy_params, "lanczos", None
 
         base_params = self.x265_params + "bframes=7:cbqpoffs=-3:crqpoffs=-3:deblock=-3:selective-sao=3:rc-lookahead=160:vbv-maxrate=10000:vbv-bufsize=12000:"
-        return False, 800, base_params, "spline36", "cas=strength=0.15"
+        return False, 800, base_params, "spline36", "cas=strength=0.09"
 
 @dataclass
 class VideoInfo:
