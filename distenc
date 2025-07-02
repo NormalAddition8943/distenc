@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 Batch encode videos to x265 with automatic crop detection, 2-pass audio normalization,
-title/closing sequence zone rates, grain presets, and job concurrency.
+title/closing sequence zone rates, extensible presets, and job concurrency.
 """
 
 import argparse, asyncio, glob, json, logging, os, re, signal, subprocess, sys, tempfile, traceback, time
 from contextlib import asynccontextmanager
+from configparser import ConfigParser
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -19,50 +20,73 @@ class EncodingStatus(Enum):
     FAILED = "failed"
     SKIPPED = "skipped"
 
-class GrainLevel(Enum):
-    NONE = "none"
-    LIGHT = "light"
-    MEDIUM = "medium"
-    HEAVY = "heavy"
-
 @dataclass
 class Config:
-    target_width: str = "-2"
-    target_height: str = "720"
-    video_bitrate_kbps: int = 800
-    audio_bitrate_kbps: int = 80
-    crop_samples: int = 5
-    ffmpeg_path: str = "ffmpeg"
-    ffprobe_path: str = "ffprobe"
-    grain_level: GrainLevel = GrainLevel.NONE
-
-    x265_params: str = (
-        "hme=1:hme-search=hex,hex,umh:hme-range=25,25,26:subme=7:min-keyint=48:"
-        "keyint=800:aq-mode=4:aq-strength=1.0:"
-        "aq-motion=1:qcomp=0.65:ref=4:rd=4:dynamic-rd=4:psy-rd=1.8:"
-        "psy-rdoq=1.0:tskip=1:tskip-fast=1:no-rect=1:frame-threads=1:limit-sao=1:"
-        "no-high-tier=1:hdr10-opt=1:"
-    )
+    target_width: str
+    target_height: str
+    video_bitrate_kbps: int
+    audio_bitrate_kbps: int
+    crop_samples: int
+    ffmpeg_path: str
+    ffprobe_path: str
+    preset_name: str
+    base_x265_params: str
+    preset_config: dict
 
     title_rate: Optional[Tuple[int, float]] = None
     closing_rate: Optional[Tuple[int, float]] = None
     skip_first_episodes: bool = False
     one_pass: bool = False
 
+    def from_ini(cls, ini_path: Path, preset_name: str, **overrides):
+        parser = ConfigParser()
+        parser.read(ini_path)
+
+        if f"preset_{preset_name}" not in parser:
+            raise ValueError(f"Preset '{preset_name}' not found in {ini_path}")
+
+        defaults = dict(parser['DEFAULT'])
+        base_params = parser['base_x265_params']['params']
+        preset_config = dict(parser[f'preset_{preset_name}'])
+
+        # Convert types
+        defaults['video_bitrate_kbps'] = int(defaults['video_bitrate_kbps'])
+        defaults['audio_bitrate_kbps'] = int(defaults['audio_bitrate_kbps'])
+        defaults['crop_samples'] = int(defaults['crop_samples'])
+
+        preset_config['use_one_pass'] = preset_config['use_one_pass'].lower() == 'true'
+        preset_config['crf_or_rate'] = int(preset_config['crf_or_rate'])
+
+        # Apply overrides
+        defaults.update(overrides)
+
+        return cls(
+            target_width=defaults['target_width'],
+            target_height=defaults['target_height'],
+            video_bitrate_kbps=defaults['video_bitrate_kbps'],
+            audio_bitrate_kbps=defaults['audio_bitrate_kbps'],
+            crop_samples=defaults['crop_samples'],
+            ffmpeg_path=defaults['ffmpeg_path'],
+            ffprobe_path=defaults['ffprobe_path'],
+            preset_name=preset_name,
+            base_x265_params=base_params,
+            preset_config=preset_config,
+            **{k: v for k, v in overrides.items() if k in ['title_rate', 'closing_rate', 'skip_first_episodes', 'one_pass']}
+        )
+
     def get_encoding_params(self) -> Tuple[bool, int, str, str, str]:
         """Returns (use_one_pass, crf_or_rate, x265_params, scale_filter, sharpen_filter)"""
-        if self.grain_level == GrainLevel.LIGHT:
-            light_params = self.x265_params + "bframes=6:cbqpoffs=-1:crqpoffs=-1:deblock=2:no-amp=1:selective-sao=4:rc-lookahead=160:vbv-maxrate=10000:vbv-bufsize=12000:"
-            return False, 1200, light_params, "spline36", None
-        elif self.grain_level == GrainLevel.MEDIUM:
-            medium_params = self.x265_params + "bframes=5:cbqpoffs=1:crqpoffs=1:deblock=4:no-amp=1:selective-sao=4:nr-inter=200:nr-intra=50:rc-lookahead=160:vbv-maxrate=5000:vbv-bufsize=6000:"
-            return False, 1000, medium_params, "spline36", None
-        elif self.grain_level == GrainLevel.HEAVY:
-            heavy_params = self.x265_params + "hevc-aq=1:mcstf=1:bframes=5:cbqpoffs=3:crqpoffs=3:deblock=6:no-amp=1:selective-sao=4:nr-inter=1000:nr-intra=400:rc-lookahead=50:vbv-maxrate=2500:vbv-bufsize=3000:"
-            return True, 33, heavy_params, "lanczos", None
+        preset = self.preset_config
+        combined_params = self.base_x265_params + preset['x265_params']
+        sharpen_filter = preset['sharpen_filter'] if preset['sharpen_filter'] else None
 
-        base_params = self.x265_params + "bframes=7:cbqpoffs=-3:crqpoffs=-3:deblock=-3:selective-sao=3:rc-lookahead=160:vbv-maxrate=10000:vbv-bufsize=12000:"
-        return False, 800, base_params, "spline36", "cas=strength=0.09"
+        return (
+            preset['use_one_pass'],
+            preset['crf_or_rate'],
+            combined_params,
+            preset['scale_filter'],
+            sharpen_filter
+        )
 
 @dataclass
 class VideoInfo:
@@ -485,7 +509,7 @@ class BatchProcessor:
             self.logger.info("No jobs to process")
             return True
 
-        self.logger.info(f"Processing {len(jobs)} jobs with {max_workers} workers using grain level: {self.config.grain_level.value}")
+        self.logger.info(f"Processing {len(jobs)} jobs with {max_workers} workers using preset: {self.config.preset_name}")
         semaphore = asyncio.Semaphore(max_workers)
         tasks = [self._process_job(job, semaphore, scratch_dir) for job in jobs]
 
@@ -512,8 +536,41 @@ def parse_zone(s: Optional[str]) -> Optional[Tuple[int, float]]:
     except (ValueError, IndexError) as e:
         raise argparse.ArgumentTypeError(f"Invalid format: {e}")
 
+def get_available_presets(ini_path: Path) -> List[str]:
+    """Get list of available presets from INI file"""
+    parser = ConfigParser()
+    parser.read(ini_path)
+    return [
+        section[7:] for section in parser.sections()
+        if section.startswith('preset_')
+    ]
+
 async def main_async():
     parser = argparse.ArgumentParser(description="Batch x265 encode with crop detection, 2-pass audio normalization, and grain control")
+
+    script_dir = Path(__file__).parent
+    parser.add_argument("--config", type=Path, default=script_dir / "presets.ini",
+                       help="Configuration file (default: presets.ini)")
+    parser.add_argument("--list-presets", action="store_true", help="List available presets and exit")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
+
+    # Parse known args first to handle --list-presets without requiring other args
+    known_args, remaining_args = parser.parse_known_args()
+
+    logging.basicConfig(level=logging.DEBUG if known_args.verbose else logging.INFO,
+                       format="%(asctime)s - %(levelname)s - %(message)s")
+
+    if not known_args.config.exists():
+        parser.error(f"Configuration file not found: {known_args.config}")
+
+    if known_args.list_presets:
+        presets = get_available_presets(known_args.config)
+        print("Available presets:")
+        for preset in presets:
+            print(f"  {preset}")
+        return 0
+
+    # Add required arguments only if not listing presets
     parser.add_argument("-i", "--inputs", nargs="+", type=Path, required=True, help="Input video files")
     parser.add_argument("-o", "--output-dir", type=Path, required=True, help="Output directory")
     parser.add_argument("-s", "--scratch-dir", type=Path, required=True, help="Temp directory")
@@ -523,24 +580,21 @@ async def main_async():
     parser.add_argument("--closing-rate", type=str, help="Closing sequence rate 'seconds,multiplier'")
     parser.add_argument("--skip-rate-for-first-episodes", action="store_true", help="Skip rates for E01 episodes")
     parser.add_argument("--one-pass", action="store_true", help="Use one-pass processing")
-    parser.add_argument("--grain", choices=["none", "light", "medium", "heavy"], default="none",
-                       help="Grain/noise reduction level (default: none)")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
+    parser.add_argument("--preset", type=str, default="none",
+                       help="Encoding preset (default: none)")
 
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
-                       format="%(asctime)s - %(levelname)s - %(message)s")
-
     try:
-        config = Config(
+        config = Config.from_ini(
+            args.config,
+            args.preset,
             title_rate=parse_zone(args.title_rate),
             closing_rate=parse_zone(args.closing_rate),
             skip_first_episodes=args.skip_rate_for_first_episodes,
-            one_pass=args.one_pass,
-            grain_level=GrainLevel(args.grain)
+            one_pass=args.one_pass
         )
-    except argparse.ArgumentTypeError as e:
+    except (argparse.ArgumentTypeError, ValueError) as e:
         parser.error(str(e))
 
     processor = BatchProcessor(config)
