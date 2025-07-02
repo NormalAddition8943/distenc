@@ -38,7 +38,7 @@ class Config:
     skip_first_episodes: bool = False
     one_pass: bool = False
 
-    def from_ini(cls, ini_path: Path, preset_name: str, **overrides):
+    def from_ini(ini_path: Path, preset_name: str, **overrides):
         parser = ConfigParser()
         parser.read(ini_path)
 
@@ -60,7 +60,7 @@ class Config:
         # Apply overrides
         defaults.update(overrides)
 
-        return cls(
+        return Config(
             target_width=defaults['target_width'],
             target_height=defaults['target_height'],
             video_bitrate_kbps=defaults['video_bitrate_kbps'],
@@ -579,16 +579,16 @@ async def main_async():
     parser.add_argument("--title-rate", type=str, help="Title sequence rate 'seconds,multiplier'")
     parser.add_argument("--closing-rate", type=str, help="Closing sequence rate 'seconds,multiplier'")
     parser.add_argument("--skip-rate-for-first-episodes", action="store_true", help="Skip rates for E01 episodes")
-    parser.add_argument("--one-pass", action="store_true", help="Use one-pass processing")
-    parser.add_argument("--preset", type=str, default="none",
+    parser.add_argument("-1", "--one-pass", action="store_true", help="Use one-pass processing")
+    parser.add_argument("-p", "--preset", type=str, required=True, default="none",
                        help="Encoding preset (default: none)")
 
     args = parser.parse_args()
 
     try:
         config = Config.from_ini(
-            args.config,
-            args.preset,
+            ini_path=args.config,
+            preset_name=args.preset,
             title_rate=parse_zone(args.title_rate),
             closing_rate=parse_zone(args.closing_rate),
             skip_first_episodes=args.skip_rate_for_first_episodes,
