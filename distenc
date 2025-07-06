@@ -20,73 +20,26 @@ class EncodingStatus(Enum):
     FAILED = "failed"
     SKIPPED = "skipped"
 
-@dataclass
-class Config:
-    target_width: str
-    target_height: str
-    video_bitrate_kbps: int
-    audio_bitrate_kbps: int
-    crop_samples: int
-    ffmpeg_path: str
-    ffprobe_path: str
-    preset_name: str
-    base_x265_params: str
-    preset_config: dict
+def load_config(ini_path: Path, preset_name: str, **overrides) -> dict:
+    """Load configuration from INI file, merging default, base, and preset sections"""
+    parser = ConfigParser()
+    parser.read(ini_path)
 
-    title_rate: Optional[Tuple[int, float]] = None
-    closing_rate: Optional[Tuple[int, float]] = None
-    skip_first_episodes: bool = False
-    one_pass: bool = False
+    if f"preset_{preset_name}" not in parser:
+        raise ValueError(f"Preset '{preset_name}' not found in {ini_path}")
 
-    def from_ini(ini_path: Path, preset_name: str, **overrides):
-        parser = ConfigParser()
-        parser.read(ini_path)
+    # Start with defaults, then merge base params, then preset, then overrides
+    config = dict(parser['baseline'])
+    config['preset_name'] = preset_name
+    config.update(dict(parser[f'preset_{preset_name}']))
+    config.update(overrides)
 
-        if f"preset_{preset_name}" not in parser:
-            raise ValueError(f"Preset '{preset_name}' not found in {ini_path}")
+    # Replace string-based int and floats number types
+    for key, value in config.items():
+        if isinstance(value, str) and value.replace('.', '', 1).isdigit():
+            config[key] = float(value) if '.' in value else int(value)
 
-        defaults = dict(parser['DEFAULT'])
-        base_params = parser['base_x265_params']['params']
-        preset_config = dict(parser[f'preset_{preset_name}'])
-
-        # Convert types
-        defaults['video_bitrate_kbps'] = int(defaults['video_bitrate_kbps'])
-        defaults['audio_bitrate_kbps'] = int(defaults['audio_bitrate_kbps'])
-        defaults['crop_samples'] = int(defaults['crop_samples'])
-
-        preset_config['use_one_pass'] = preset_config['use_one_pass'].lower() == 'true'
-        preset_config['crf_or_rate'] = int(preset_config['crf_or_rate'])
-
-        # Apply overrides
-        defaults.update(overrides)
-
-        return Config(
-            target_width=defaults['target_width'],
-            target_height=defaults['target_height'],
-            video_bitrate_kbps=defaults['video_bitrate_kbps'],
-            audio_bitrate_kbps=defaults['audio_bitrate_kbps'],
-            crop_samples=defaults['crop_samples'],
-            ffmpeg_path=defaults['ffmpeg_path'],
-            ffprobe_path=defaults['ffprobe_path'],
-            preset_name=preset_name,
-            base_x265_params=base_params,
-            preset_config=preset_config,
-            **{k: v for k, v in overrides.items() if k in ['title_rate', 'closing_rate', 'skip_first_episodes', 'one_pass']}
-        )
-
-    def get_encoding_params(self) -> Tuple[bool, int, str, str, str]:
-        """Returns (use_one_pass, crf_or_rate, x265_params, scale_filter, sharpen_filter)"""
-        preset = self.preset_config
-        combined_params = self.base_x265_params + preset['x265_params']
-        sharpen_filter = preset['sharpen_filter'] if preset['sharpen_filter'] else None
-
-        return (
-            preset['use_one_pass'],
-            preset['crf_or_rate'],
-            combined_params,
-            preset['scale_filter'],
-            sharpen_filter
-        )
+    return config
 
 @dataclass
 class VideoInfo:
@@ -114,7 +67,7 @@ class FFmpegError(Exception):
     pass
 
 class VideoProcessor:
-    def __init__(self, config: Config):
+    def __init__(self, config: dict):
         self.config = config
         self.logger = logging.getLogger(__name__)
 
@@ -141,7 +94,7 @@ class VideoProcessor:
         # Get duration
         try:
             result = await self._run_cmd([
-                self.config.ffprobe_path, "-v", "error", "-select_streams", "v:0",
+                self.config['ffprobe_path'], "-v", "error", "-select_streams", "v:0",
                 "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)
             ])
             info.duration = float(result.stdout.decode().strip())
@@ -150,7 +103,7 @@ class VideoProcessor:
         # Get frame rate
         try:
             result = await self._run_cmd([
-                self.config.ffprobe_path, "-v", "error", "-select_streams", "v:0",
+                self.config['ffprobe_path'], "-v", "error", "-select_streams", "v:0",
                 "-show_entries", "stream=r_frame_rate", "-of", "default=noprint_wrappers=1:nokey=1", str(path)
             ])
             frame_rate_str = result.stdout.decode().strip()
@@ -164,7 +117,7 @@ class VideoProcessor:
         # Check Dolby Vision
         try:
             result = await self._run_cmd([
-                self.config.ffprobe_path, "-v", "quiet", "-select_streams", "v:0",
+                self.config['ffprobe_path'], "-v", "quiet", "-select_streams", "v:0",
                 "-show_streams", "-print_format", "json", str(path)
             ])
             data = json.loads(result.stdout.decode())
@@ -178,7 +131,7 @@ class VideoProcessor:
         # Get chapters
         try:
             result = await self._run_cmd([
-                self.config.ffprobe_path, "-v", "quiet", "-show_chapters", "-print_format", "json", str(path)
+                self.config['ffprobe_path'], "-v", "quiet", "-show_chapters", "-print_format", "json", str(path)
             ])
             data = json.loads(result.stdout.decode())
             for chapter_data in data.get("chapters", []):
@@ -191,7 +144,7 @@ class VideoProcessor:
         # Detect text-based subtitle streams
         try:
             result = await self._run_cmd([
-                self.config.ffprobe_path, "-v", "quiet", "-show_streams",
+                self.config['ffprobe_path'], "-v", "quiet", "-show_streams",
                 "-select_streams", "s", "-print_format", "json", str(path)
             ])
             data = json.loads(result.stdout.decode())
@@ -208,16 +161,16 @@ class VideoProcessor:
         if not video_info.duration:
             raise FFmpegError("Cannot detect crop without duration")
 
-        interval = video_info.duration / self.config.crop_samples
+        interval = video_info.duration / self.config['crop_samples']
         crops = []
 
-        for i in range(self.config.crop_samples):
+        for i in range(self.config['crop_samples']):
             timestamp = i * interval
             try:
                 result = await self._run_cmd([
-                    self.config.ffmpeg_path, "-hide_banner", "-ss", f"{timestamp:.3f}",
+                    self.config['ffmpeg_path'], "-hide_banner", "-ss", f"{timestamp:.3f}",
                     "-i", str(video_info.path), "-frames:v", "5", "-vf",
-                    f"scale={self.config.target_width}:{self.config.target_height},cropdetect=round=2",
+                    f"scale={self.config['target_width']}:{self.config['target_height']},cropdetect=round=2",
                     "-f", "null", "/dev/null" if os.name != "nt" else "NUL"
                 ], timeout=60)
                 matches = re.findall(r"crop=(\d+):(\d+):(\d+):(\d+)", result.stderr.decode())
@@ -235,17 +188,17 @@ class VideoProcessor:
         return (max_x - min_x, max_y - min_y, min_x, min_y)
 
     def calculate_zones(self, video_info: VideoInfo) -> str:
-        if not self.config.title_rate and not self.config.closing_rate: return ""
-        if self.config.skip_first_episodes and "E01" in video_info.path.name: return ""
+        if not self.config['title_rate'] and not self.config['closing_rate']: return ""
+        if self.config['skip_first_episodes'] and "E01" in video_info.path.name: return ""
         if not video_info.chapters or not video_info.duration or not video_info.frame_rate: return ""
 
         zones = []
 
         # Title sequence zone
-        if self.config.title_rate:
+        if self.config['title_rate']:
             first_chapter = min(video_info.chapters, key=lambda c: c[0])
             if first_chapter[1] and first_chapter[1] <= 600:  # 10 minutes
-                seconds, multiplier = self.config.title_rate
+                seconds, multiplier = self.config['title_rate']
                 end_time = first_chapter[1]
                 start_time = max(0, end_time - seconds)
                 start_frame = int(start_time * video_info.frame_rate)
@@ -254,8 +207,8 @@ class VideoProcessor:
                     zones.append(f"{start_frame},{end_frame},b={multiplier}")
 
         # Closing sequence zone
-        if self.config.closing_rate:
-            seconds, multiplier = self.config.closing_rate
+        if self.config['closing_rate']:
+            seconds, multiplier = self.config['closing_rate']
             end_time = video_info.duration
             start_time = max(0, end_time - seconds)
             start_frame = int(start_time * video_info.frame_rate)
@@ -290,48 +243,52 @@ class VideoProcessor:
             video_info.crop_params = await self.detect_crop(video_info)
             crop_w, crop_h, crop_x, crop_y = video_info.crop_params
 
-            # Get encoding parameters based on grain level
-            use_one_pass, crf_or_rate, x265_params, scale_filter, sharpen_filter = self.config.get_encoding_params()
+            crf_or_rate = int(self.config['crf_or_rate'])
+            use_one_pass = crf_or_rate <= 50
+            x265_params = self.config['x265_params']
+            if self.config['add_x265_params']:
+                x265_params + self.config['add_x265_params']
 
             # Build video filter
-            vf_parts = [
-                f"zscale={self.config.target_width}:{self.config.target_height}:filter={scale_filter}",
-                f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}"
-            ]
-            if sharpen_filter:
-                vf_parts.append(sharpen_filter)
-
+            vf_parts = []
+            if self.config['video_filter']:
+                vf_parts.append(self.config['video_filter'])
+            if self.config['scale_filter']:
+                vf_parts.append(f"zscale={self.config['target_width']}:{self.config['target_height']}:filter={self.config['scale_filter']}")
+            vf_parts.append(f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}")
+            if self.config['sharpen_filter']:
+                vf_parts.append(self.config['sharpen_filter'])
             vf_filter = ",".join(vf_parts)
 
             zones = self.calculate_zones(video_info)
+            if zones:
+                x265_params = f"zones={zones}:{x265_params}"
 
             # Build subtitle mapping
             subtitle_args = self.build_subtitle_mapping(video_info)
 
-            if use_one_pass or self.config.one_pass:
-                # Adjust x265 params with zones if present
-                final_x265_params = x265_params
-                if zones:
-                    final_x265_params = f"zones={zones}:{x265_params}"
+            if use_one_pass or self.config.get('one_pass'):
 
                 loudnorm_filter = "loudnorm=I=-23:TP=-2.0:LRA=7"
 
                 # Single-pass FFmpeg command
                 one_pass_cmd = [
-                    self.config.ffmpeg_path, "-hide_banner", "-stats", "-y", "-i", str(job.input_path),
+                    self.config['ffmpeg_path'], "-hide_banner", "-stats", "-y", "-i", str(job.input_path),
                     # Map video and audio streams explicitly
                     "-map", "0:v:0",  # Map first video stream
                     "-map", "0:a:0",  # Map first audio stream
                     "-vf", vf_filter, "-dolbyvision", "1" if video_info.has_dolby_vision else "0",
                     "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-crf", f"{crf_or_rate}",
-                    "-preset", "slower", "-x265-params", final_x265_params,
+                    "-preset", "slower", "-x265-params", x265_params,
                     "-filter:a", loudnorm_filter, "-ac", "2", "-c:a", "libopus",
-                    "-b:a", f"{self.config.audio_bitrate_kbps}k", "-frame_duration", "60"
+                    "-b:a", f"{self.config['audio_bitrate_kbps']}k", "-frame_duration", "60"
                 ]
 
                 # Add subtitle mappings
                 one_pass_cmd.extend(subtitle_args)
                 one_pass_cmd.append(str(job.output_path))
+
+                self.logger.debug(f"One pass: {' '.join(one_pass_cmd)}")
 
                 with job.token_path.open("w") as log_file:
                     process = await asyncio.create_subprocess_exec(
@@ -347,21 +304,21 @@ class VideoProcessor:
 
             else:
                 # Two-pass encoding
-                final_x265_params = x265_params
-                if zones:
-                    final_x265_params = f"zones={zones}:{x265_params}"
+
                 stats_path = job.temp_path.with_suffix(".stats")
 
                 # First pass
                 first_pass = [
-                    self.config.ffmpeg_path, "-hide_banner", "-y", "-i", str(job.input_path),
+                    self.config['ffmpeg_path'], "-hide_banner", "-y", "-i", str(job.input_path),
                     "-vf", vf_filter, "-dolbyvision", "1" if video_info.has_dolby_vision else "0",
                     "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-b:v", f"{crf_or_rate}k",
-                    "-preset", "slower", "-x265-params", f"pass=1:stats={stats_path}:no-slow-firstpass=1:{final_x265_params}",
+                    "-preset", "slower", "-x265-params", f"pass=1:stats={stats_path}:no-slow-firstpass=1:{x265_params}",
                     "-map", "0:v:0", "-f", "null", "/dev/null" if os.name != "nt" else "NUL",
                     "-map", "0:a:0", "-af", "loudnorm=I=-23:TP=-2.0:LRA=7:print_format=json",
                     "-f", "null", "-"
                 ]
+
+                self.logger.debug(f"First pass: {' '.join(first_pass)}")
 
                 with job.token_path.open("w") as log_file:
                     process = await asyncio.create_subprocess_exec(
@@ -391,20 +348,22 @@ class VideoProcessor:
                                  f"offset={loudnorm_data.get('offset', '0.0')}")
 
                 second_pass = [
-                    self.config.ffmpeg_path, "-hide_banner", "-stats", "-y", "-i", str(job.input_path),
+                    self.config['ffmpeg_path'], "-hide_banner", "-stats", "-y", "-i", str(job.input_path),
                     # Map video and audio streams explicitly
                     "-map", "0:v:0",  # Map first video stream
                     "-map", "0:a:0",  # Map first audio stream
                     "-vf", vf_filter, "-dolbyvision", "1" if video_info.has_dolby_vision else "0",
                     "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-b:v", f"{crf_or_rate}k",
-                    "-preset", "slower", "-x265-params", f"pass=2:stats={stats_path}:{final_x265_params}",
+                    "-preset", "slower", "-x265-params", f"pass=2:stats={stats_path}:{x265_params}",
                     "-filter:a", loudnorm_filter, "-ac", "2", "-c:a", "libopus",
-                    "-b:a", f"{self.config.audio_bitrate_kbps}k", "-frame_duration", "60"
+                    "-b:a", f"{self.config['audio_bitrate_kbps']}k", "-frame_duration", "60"
                 ]
 
                 # Add subtitle mappings
                 second_pass.extend(subtitle_args)
                 second_pass.append(str(job.output_path))
+
+                self.logger.debug(f"Second pass: {' '.join(second_pass)}")
 
                 with job.token_path.open("a") as log_file:
                     process = await asyncio.create_subprocess_exec(
@@ -434,7 +393,7 @@ class VideoProcessor:
                 job.temp_path = None
 
 class BatchProcessor:
-    def __init__(self, config: Config):
+    def __init__(self, config: dict):
         self.config = config
         self.processor = VideoProcessor(config)
         self.logger = logging.getLogger(__name__)
@@ -451,7 +410,7 @@ class BatchProcessor:
         self._shutdown_event.set()
 
     def _check_dependencies(self) -> bool:
-        missing = [tool for tool in [self.config.ffmpeg_path, self.config.ffprobe_path] if not which(tool)]
+        missing = [tool for tool in [self.config['ffmpeg_path'], self.config['ffprobe_path']] if not which(tool)]
         if missing:
             self.logger.error(f"Missing tools: {missing}")
             return False
@@ -502,14 +461,14 @@ class BatchProcessor:
         for input_file in input_files:
             if input_file.is_file():
                 token_path = (token_dir / input_file.name).with_suffix(".token")
-                output_path = output_dir / input_file.name
+                output_path = (output_dir / input_file.name).with_suffix(".mkv")
                 jobs.append(EncodingJob(input_file, output_path, token_path))
 
         if not jobs:
             self.logger.info("No jobs to process")
             return True
 
-        self.logger.info(f"Processing {len(jobs)} jobs with {max_workers} workers using preset: {self.config.preset_name}")
+        self.logger.info(f"Processing {len(jobs)} jobs with {max_workers} workers using preset: {self.config['preset_name']}")
         semaphore = asyncio.Semaphore(max_workers)
         tasks = [self._process_job(job, semaphore, scratch_dir) for job in jobs]
 
@@ -549,9 +508,9 @@ async def main_async():
     parser = argparse.ArgumentParser(description="Batch x265 encode with crop detection, 2-pass audio normalization, and grain control")
 
     script_dir = Path(__file__).resolve().parent
-    parser.add_argument("--config", type=Path, default=script_dir / "presets.ini",
+    parser.add_argument("-c", "--config", type=Path, default=script_dir / "presets.ini",
                        help="Configuration file (default: presets.ini)")
-    parser.add_argument("--list-presets", action="store_true", help="List available presets and exit")
+    parser.add_argument("-l", "--list-presets", action="store_true", help="List available presets and exit")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
 
     # Parse known args first to handle --list-presets without requiring other args
@@ -586,7 +545,7 @@ async def main_async():
     args = parser.parse_args()
 
     try:
-        config = Config.from_ini(
+        config = load_config(
             ini_path=args.config,
             preset_name=args.preset,
             title_rate=parse_zone(args.title_rate),
