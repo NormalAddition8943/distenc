@@ -245,9 +245,12 @@ class VideoProcessor:
 
             crf_or_rate = int(self.config['crf_or_rate'])
             use_one_pass = crf_or_rate <= 50
-            x265_params = self.config['x265_params']
+
+            x265_params = dict(item.split('=') for item in self.config['x265_params'].split(':'))
             if self.config['add_x265_params']:
-                x265_params + self.config['add_x265_params']
+                x265_params.update(dict(item.split('=') for item in self.config['add_x265_params'].split(':')))
+
+            x265_params = ':'.join(f"{k}={v}" for k, v in x265_params.items())
 
             # Build video filter
             vf_parts = []
