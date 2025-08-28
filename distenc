@@ -280,7 +280,7 @@ class VideoProcessor:
                     # Map video and audio streams explicitly
                     "-map", "0:v:0",  # Map first video stream
                     "-map", "0:a:m:language:eng",  # Map first english audio stream
-                    "-map", "0:s:m:language:eng:disp:forced", # Map forced english subs
+                    "-map", "0:s:m:language:eng", # Map first english subs
                     "-vf", vf_filter, "-dolbyvision", "1" if video_info.has_dolby_vision else "0",
                     "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-crf", f"{crf_or_rate}",
                     "-preset", "slower", "-x265-params", x265_params,
@@ -356,7 +356,7 @@ class VideoProcessor:
                     # Map video and audio streams explicitly
                     "-map", "0:v:0",  # Map first video stream
                     "-map", "0:a:m:language:eng",  # Map first audio stream
-                    "-map", "0:s:m:language:eng:disp:forced", # Map english forced subs
+                    "-map", "0:s:m:language:eng", # Map english first sub
                     "-vf", vf_filter, "-dolbyvision", "1" if video_info.has_dolby_vision else "0",
                     "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-b:v", f"{crf_or_rate}k",
                     "-preset", "slower", "-x265-params", f"pass=2:stats={stats_path}:{x265_params}",
