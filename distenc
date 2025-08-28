@@ -13,12 +13,14 @@ from pathlib import Path
 from shutil import which
 from typing import Dict, List, Optional, Tuple, AsyncGenerator
 
+
 class EncodingStatus(Enum):
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
     FAILED = "failed"
     SKIPPED = "skipped"
+
 
 def load_config(ini_path: Path, preset_name: str, **overrides) -> dict:
     """Load configuration from INI file, merging default, base, and preset sections"""
@@ -29,17 +31,18 @@ def load_config(ini_path: Path, preset_name: str, **overrides) -> dict:
         raise ValueError(f"Preset '{preset_name}' not found in {ini_path}")
 
     # Start with defaults, then merge base params, then preset, then overrides
-    config = dict(parser['baseline'])
-    config['preset_name'] = preset_name
-    config.update(dict(parser[f'preset_{preset_name}']))
+    config = dict(parser["baseline"])
+    config["preset_name"] = preset_name
+    config.update(dict(parser[f"preset_{preset_name}"]))
     config.update(overrides)
 
     # Replace string-based int and floats number types
     for key, value in config.items():
-        if isinstance(value, str) and value.replace('.', '', 1).isdigit():
-            config[key] = float(value) if '.' in value else int(value)
+        if isinstance(value, str) and value.replace(".", "", 1).isdigit():
+            config[key] = float(value) if "." in value else int(value)
 
     return config
+
 
 @dataclass
 class VideoInfo:
@@ -50,6 +53,7 @@ class VideoInfo:
     crop_params: Optional[Tuple[int, int, int, int]] = None
     chapters: List[Tuple[float, Optional[float]]] = field(default_factory=list)
     text_subtitle_streams: List[int] = field(default_factory=list)
+
 
 @dataclass
 class EncodingJob:
@@ -62,23 +66,34 @@ class EncodingJob:
     end_time: Optional[float] = None
     error_message: Optional[str] = None
 
+
 class FFmpegError(Exception):
     print(traceback.format_exc())
     pass
+
 
 class VideoProcessor:
     def __init__(self, config: dict):
         self.config = config
         self.logger = logging.getLogger(__name__)
 
-    async def _run_cmd(self, cmd: List[str], timeout: int = 300) -> subprocess.CompletedProcess:
+    async def _run_cmd(
+        self, cmd: List[str], timeout: int = 300
+    ) -> subprocess.CompletedProcess:
         try:
             process = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                stdin=asyncio.subprocess.DEVNULL, env={**os.environ, "TERM": "dumb", "MALLOC_ARENA_MAX": "1"}
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.DEVNULL,
+                env={**os.environ, "TERM": "dumb", "MALLOC_ARENA_MAX": "1"},
             )
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-            result = subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=timeout
+            )
+            result = subprocess.CompletedProcess(
+                cmd, process.returncode, stdout, stderr
+            )
             if result.returncode != 0:
                 raise FFmpegError(f"Command failed: {' '.join(cmd)}\n{stderr.decode()}")
             return result
@@ -93,67 +108,142 @@ class VideoProcessor:
 
         # Get duration
         try:
-            result = await self._run_cmd([
-                self.config['ffprobe_path'], "-v", "error", "-select_streams", "v:0",
-                "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)
-            ])
+            result = await self._run_cmd(
+                [
+                    self.config["ffprobe_path"],
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(path),
+                ]
+            )
             info.duration = float(result.stdout.decode().strip())
-        except: pass
+        except:
+            pass
 
         # Get frame rate
         try:
-            result = await self._run_cmd([
-                self.config['ffprobe_path'], "-v", "error", "-select_streams", "v:0",
-                "-show_entries", "stream=r_frame_rate", "-of", "default=noprint_wrappers=1:nokey=1", str(path)
-            ])
+            result = await self._run_cmd(
+                [
+                    self.config["ffprobe_path"],
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=r_frame_rate",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(path),
+                ]
+            )
             frame_rate_str = result.stdout.decode().strip()
             if "/" in frame_rate_str:
                 num, den = map(int, frame_rate_str.split("/"))
                 info.frame_rate = num / den
             else:
                 info.frame_rate = float(frame_rate_str)
-        except: pass
+        except:
+            pass
 
         # Check Dolby Vision
         try:
-            result = await self._run_cmd([
-                self.config['ffprobe_path'], "-v", "quiet", "-select_streams", "v:0",
-                "-show_streams", "-print_format", "json", str(path)
-            ])
+            result = await self._run_cmd(
+                [
+                    self.config["ffprobe_path"],
+                    "-v",
+                    "quiet",
+                    "-select_streams",
+                    "v:0",
+                    "-show_streams",
+                    "-print_format",
+                    "json",
+                    str(path),
+                ]
+            )
             data = json.loads(result.stdout.decode())
             stream = data.get("streams", [{}])[0]
             side_data_list = stream.get("side_data_list", [])
             info.has_dolby_vision = any(
-                sd.get("side_data_type") == "DOVI configuration record" for sd in side_data_list
+                sd.get("side_data_type") == "DOVI configuration record"
+                for sd in side_data_list
             )
-        except: pass
+        except:
+            pass
 
         # Get chapters
         try:
-            result = await self._run_cmd([
-                self.config['ffprobe_path'], "-v", "quiet", "-show_chapters", "-print_format", "json", str(path)
-            ])
+            result = await self._run_cmd(
+                [
+                    self.config["ffprobe_path"],
+                    "-v",
+                    "quiet",
+                    "-show_chapters",
+                    "-print_format",
+                    "json",
+                    str(path),
+                ]
+            )
             data = json.loads(result.stdout.decode())
             for chapter_data in data.get("chapters", []):
                 start_time = float(chapter_data.get("start_time", 0))
                 end_time = chapter_data.get("end_time")
-                if end_time is not None: end_time = float(end_time)
+                if end_time is not None:
+                    end_time = float(end_time)
                 info.chapters.append((start_time, end_time))
-        except: pass
+        except:
+            pass
 
-        # Detect text-based subtitle streams
+        # Include any text-based subtitles and any forced English subtitles
         try:
-            result = await self._run_cmd([
-                self.config['ffprobe_path'], "-v", "quiet", "-show_streams",
-                "-select_streams", "s", "-print_format", "json", str(path)
-            ])
+            result = await self._run_cmd(
+                [
+                    self.config["ffprobe_path"],
+                    "-v",
+                    "quiet",
+                    "-show_streams",
+                    "-select_streams",
+                    "s",
+                    "-print_format",
+                    "json",
+                    str(path),
+                ]
+            )
             data = json.loads(result.stdout.decode())
             for i, stream in enumerate(data.get("streams", [])):
-                codec_name = stream.get("codec_name", "").lower()
-                # Include text-based subtitle formats
-                if codec_name in ["subrip", "ass", "ssa", "webvtt", "srt", "mov_text", "text"]:
+
+                # Is it a text-based subtitle (which are tiny, so take any language!)
+                subtitle_codec = stream.get("codec_name", "").lower()
+                is_text_codec = subtitle_codec in [
+                    "subrip",
+                    "ass",
+                    "ssa",
+                    "webvtt",
+                    "srt",
+                    "mov_text",
+                    "text",
+                ]
+
+                # Is it a forced english subtitle? (which might be large graphic-based, but worth it because forced subtitles are critical)
+                tags = stream.get("tags", {})
+                language = tags.get("language", "").lower()
+                disposition = stream.get("disposition", {})
+                is_forced_english = disposition.get("forced", 0) == 1 and language in [
+                    "eng",
+                    "en",
+                    "english",
+                ]
+
+                if is_text_codec or is_forced_english:
                     info.text_subtitle_streams.append(i)
-        except: pass
+
+        except:
+            pass
 
         return info
 
@@ -161,23 +251,40 @@ class VideoProcessor:
         if not video_info.duration:
             raise FFmpegError("Cannot detect crop without duration")
 
-        interval = video_info.duration / self.config['crop_samples']
+        interval = video_info.duration / self.config["crop_samples"]
         crops = []
 
-        for i in range(self.config['crop_samples']):
+        for i in range(self.config["crop_samples"]):
             timestamp = i * interval
             try:
-                result = await self._run_cmd([
-                    self.config['ffmpeg_path'], "-hide_banner", "-ss", f"{timestamp:.3f}",
-                    "-i", str(video_info.path), "-frames:v", "5", "-vf",
-                    f"scale={self.config['target_width']}:{self.config['target_height']},cropdetect=round=2",
-                    "-f", "null", "/dev/null" if os.name != "nt" else "NUL"
-                ], timeout=60)
-                matches = re.findall(r"crop=(\d+):(\d+):(\d+):(\d+)", result.stderr.decode())
-                if matches: crops.append(tuple(map(int, matches[-1])))
-            except: pass
+                result = await self._run_cmd(
+                    [
+                        self.config["ffmpeg_path"],
+                        "-hide_banner",
+                        "-ss",
+                        f"{timestamp:.3f}",
+                        "-i",
+                        str(video_info.path),
+                        "-frames:v",
+                        "5",
+                        "-vf",
+                        f"scale={self.config['target_width']}:{self.config['target_height']},cropdetect=round=2",
+                        "-f",
+                        "null",
+                        "/dev/null" if os.name != "nt" else "NUL",
+                    ],
+                    timeout=60,
+                )
+                matches = re.findall(
+                    r"crop=(\d+):(\d+):(\d+):(\d+)", result.stderr.decode()
+                )
+                if matches:
+                    crops.append(tuple(map(int, matches[-1])))
+            except:
+                pass
 
-        if not crops: raise FFmpegError("No crop parameters detected")
+        if not crops:
+            raise FFmpegError("No crop parameters detected")
 
         # Find bounding box
         min_x = min(crop[2] for crop in crops)
@@ -188,17 +295,24 @@ class VideoProcessor:
         return (max_x - min_x, max_y - min_y, min_x, min_y)
 
     def calculate_zones(self, video_info: VideoInfo) -> str:
-        if not self.config['title_rate'] and not self.config['closing_rate']: return ""
-        if self.config['skip_first_episodes'] and "E01" in video_info.path.name: return ""
-        if not video_info.chapters or not video_info.duration or not video_info.frame_rate: return ""
+        if not self.config["title_rate"] and not self.config["closing_rate"]:
+            return ""
+        if self.config["skip_first_episodes"] and "E01" in video_info.path.name:
+            return ""
+        if (
+            not video_info.chapters
+            or not video_info.duration
+            or not video_info.frame_rate
+        ):
+            return ""
 
         zones = []
 
         # Title sequence zone
-        if self.config['title_rate']:
+        if self.config["title_rate"]:
             first_chapter = min(video_info.chapters, key=lambda c: c[0])
             if first_chapter[1] and first_chapter[1] <= 600:  # 10 minutes
-                seconds, multiplier = self.config['title_rate']
+                seconds, multiplier = self.config["title_rate"]
                 end_time = first_chapter[1]
                 start_time = max(0, end_time - seconds)
                 start_frame = int(start_time * video_info.frame_rate)
@@ -207,8 +321,8 @@ class VideoProcessor:
                     zones.append(f"{start_frame},{end_frame},b={multiplier}")
 
         # Closing sequence zone
-        if self.config['closing_rate']:
-            seconds, multiplier = self.config['closing_rate']
+        if self.config["closing_rate"]:
+            seconds, multiplier = self.config["closing_rate"]
             end_time = video_info.duration
             start_time = max(0, end_time - seconds)
             start_frame = int(start_time * video_info.frame_rate)
@@ -243,24 +357,33 @@ class VideoProcessor:
             video_info.crop_params = await self.detect_crop(video_info)
             crop_w, crop_h, crop_x, crop_y = video_info.crop_params
 
-            crf_or_rate = int(self.config['crf_or_rate'])
+            crf_or_rate = int(self.config["crf_or_rate"])
             use_one_pass = crf_or_rate <= 50
 
-            x265_params = dict(item.split('=') for item in self.config['x265_params'].split(':'))
-            if self.config['add_x265_params']:
-                x265_params.update(dict(item.split('=') for item in self.config['add_x265_params'].split(':')))
+            x265_params = dict(
+                item.split("=") for item in self.config["x265_params"].split(":")
+            )
+            if self.config["add_x265_params"]:
+                x265_params.update(
+                    dict(
+                        item.split("=")
+                        for item in self.config["add_x265_params"].split(":")
+                    )
+                )
 
-            x265_params = ':'.join(f"{k}={v}" for k, v in x265_params.items())
+            x265_params = ":".join(f"{k}={v}" for k, v in x265_params.items())
 
             # Build video filter
             vf_parts = []
-            if self.config['video_filter']:
-                vf_parts.append(self.config['video_filter'])
-            if self.config['scale_filter']:
-                vf_parts.append(f"zscale={self.config['target_width']}:{self.config['target_height']}:filter={self.config['scale_filter']}")
+            if self.config["video_filter"]:
+                vf_parts.append(self.config["video_filter"])
+            if self.config["scale_filter"]:
+                vf_parts.append(
+                    f"zscale={self.config['target_width']}:{self.config['target_height']}:filter={self.config['scale_filter']}"
+                )
             vf_parts.append(f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}")
-            if self.config['sharpen_filter']:
-                vf_parts.append(self.config['sharpen_filter'])
+            if self.config["sharpen_filter"]:
+                vf_parts.append(self.config["sharpen_filter"])
             vf_filter = ",".join(vf_parts)
 
             zones = self.calculate_zones(video_info)
@@ -270,22 +393,49 @@ class VideoProcessor:
             # Build subtitle mapping
             subtitle_args = self.build_subtitle_mapping(video_info)
 
-            if use_one_pass or self.config.get('one_pass'):
+            if use_one_pass or self.config.get("one_pass"):
 
                 loudnorm_filter = "loudnorm=I=-23:TP=-2.0:LRA=7"
 
                 # Single-pass FFmpeg command
                 one_pass_cmd = [
-                    self.config['ffmpeg_path'], "-hide_banner", "-stats", "-y", "-i", str(job.input_path),
+                    self.config["ffmpeg_path"],
+                    "-hide_banner",
+                    "-stats",
+                    "-y",
+                    "-i",
+                    str(job.input_path),
                     # Map video and audio streams explicitly
-                    "-map", "0:v:0",  # Map first video stream
-                    "-map", "0:a:m:language:eng",  # Map first english audio stream
-                    "-map", "0:s:m:language:eng", # Map first english subs
-                    "-vf", vf_filter, "-dolbyvision", "1" if video_info.has_dolby_vision else "0",
-                    "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-crf", f"{crf_or_rate}",
-                    "-preset", "slower", "-x265-params", x265_params,
-                    "-filter:a", loudnorm_filter, "-ac", "2", "-c:a", "libopus",
-                    "-b:a", f"{self.config['audio_bitrate_kbps']}k", "-frame_duration", "60"
+                    "-map",
+                    "0:v:0",  # Map first video stream
+                    "-map",
+                    "0:a:m:language:eng",  # Map first english audio stream
+                    "-map",
+                    "0:s:m:language:eng",  # Map first english subs
+                    "-vf",
+                    vf_filter,
+                    "-dolbyvision",
+                    "1" if video_info.has_dolby_vision else "0",
+                    "-c:v",
+                    "libx265",
+                    "-pix_fmt",
+                    "yuv420p10le",
+                    "-crf",
+                    f"{crf_or_rate}",
+                    "-preset",
+                    "slower",
+                    "-x265-params",
+                    x265_params,
+                    "-filter:a",
+                    loudnorm_filter,
+                    "-ac",
+                    "2",
+                    "-c:a",
+                    "libopus",
+                    "-b:a",
+                    f"{self.config['audio_bitrate_kbps']}k",
+                    "-frame_duration",
+                    "60",
                 ]
 
                 # Add subtitle mappings
@@ -296,12 +446,17 @@ class VideoProcessor:
 
                 with job.token_path.open("w") as log_file:
                     process = await asyncio.create_subprocess_exec(
-                        *one_pass_cmd, stdout=log_file, stderr=log_file, stdin=asyncio.subprocess.DEVNULL
+                        *one_pass_cmd,
+                        stdout=log_file,
+                        stderr=log_file,
+                        stdin=asyncio.subprocess.DEVNULL,
                     )
                     await process.wait()
 
                 if process.returncode != 0:
-                    raise FFmpegError(f"One-pass encoding failed with code {process.returncode}")
+                    raise FFmpegError(
+                        f"One-pass encoding failed with code {process.returncode}"
+                    )
 
                 job.status = EncodingStatus.COMPLETED
                 self.logger.info(f"One-pass encoding completed: {job.input_path.name}")
@@ -313,55 +468,128 @@ class VideoProcessor:
 
                 # First pass
                 first_pass = [
-                    self.config['ffmpeg_path'], "-hide_banner", "-y", "-i", str(job.input_path),
-                    "-vf", vf_filter, "-dolbyvision", "1" if video_info.has_dolby_vision else "0",
-                    "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-b:v", f"{crf_or_rate}k",
-                    "-preset", "slower", "-x265-params", f"pass=1:stats={stats_path}:no-slow-firstpass=1:{x265_params}",
-                    "-map", "0:v:0", "-f", "null", "/dev/null" if os.name != "nt" else "NUL",
-                    "-map", "0:a:m:language:eng", "-af", "loudnorm=I=-23:TP=-2.0:LRA=7:print_format=json",
-                    "-f", "null", "-"
+                    self.config["ffmpeg_path"],
+                    "-hide_banner",
+                    "-y",
+                    "-i",
+                    str(job.input_path),
+                    "-vf",
+                    vf_filter,
+                    "-dolbyvision",
+                    "1" if video_info.has_dolby_vision else "0",
+                    "-c:v",
+                    "libx265",
+                    "-pix_fmt",
+                    "yuv420p10le",
+                    "-b:v",
+                    f"{crf_or_rate}k",
+                    "-preset",
+                    "slower",
+                    "-x265-params",
+                    f"pass=1:stats={stats_path}:no-slow-firstpass=1:{x265_params}",
+                    "-map",
+                    "0:v:0",
+                    "-f",
+                    "null",
+                    "/dev/null" if os.name != "nt" else "NUL",
+                    "-map",
+                    "0:a:m:language:eng",
+                    "-af",
+                    "loudnorm=I=-23:TP=-2.0:LRA=7:print_format=json",
+                    "-f",
+                    "null",
+                    "-",
                 ]
 
                 self.logger.debug(f"First pass: {' '.join(first_pass)}")
 
                 with job.token_path.open("w") as log_file:
                     process = await asyncio.create_subprocess_exec(
-                        *first_pass, stdout=log_file, stderr=log_file, stdin=asyncio.subprocess.DEVNULL
+                        *first_pass,
+                        stdout=log_file,
+                        stderr=log_file,
+                        stdin=asyncio.subprocess.DEVNULL,
                     )
                     await process.wait()
 
                 if process.returncode != 0:
-                    raise FFmpegError(f"First pass failed with code {process.returncode}")
+                    raise FFmpegError(
+                        f"First pass failed with code {process.returncode}"
+                    )
 
                 # Extract loudnorm measurements
                 loudnorm_data = {}
                 with job.token_path.open("r") as log_file:
                     for line in log_file:
-                        if '"input_i"' in line: loudnorm_data['measured_I'] = re.search(r'"input_i"\s*:\s*"([^"]*)"', line).group(1)
-                        elif '"input_tp"' in line: loudnorm_data['measured_TP'] = re.search(r'"input_tp"\s*:\s*"([^"]*)"', line).group(1)
-                        elif '"input_lra"' in line: loudnorm_data['measured_LRA'] = re.search(r'"input_lra"\s*:\s*"([^"]*)"', line).group(1)
-                        elif '"input_thresh"' in line: loudnorm_data['measured_thresh'] = re.search(r'"input_thresh"\s*:\s*"([^"]*)"', line).group(1)
-                        elif '"target_offset"' in line: loudnorm_data['offset'] = re.search(r'"target_offset"\s*:\s*"([^"]*)"', line).group(1)
+                        if '"input_i"' in line:
+                            loudnorm_data["measured_I"] = re.search(
+                                r'"input_i"\s*:\s*"([^"]*)"', line
+                            ).group(1)
+                        elif '"input_tp"' in line:
+                            loudnorm_data["measured_TP"] = re.search(
+                                r'"input_tp"\s*:\s*"([^"]*)"', line
+                            ).group(1)
+                        elif '"input_lra"' in line:
+                            loudnorm_data["measured_LRA"] = re.search(
+                                r'"input_lra"\s*:\s*"([^"]*)"', line
+                            ).group(1)
+                        elif '"input_thresh"' in line:
+                            loudnorm_data["measured_thresh"] = re.search(
+                                r'"input_thresh"\s*:\s*"([^"]*)"', line
+                            ).group(1)
+                        elif '"target_offset"' in line:
+                            loudnorm_data["offset"] = re.search(
+                                r'"target_offset"\s*:\s*"([^"]*)"', line
+                            ).group(1)
 
                 # Second pass
-                loudnorm_filter = (f"loudnorm=I=-23:TP=-2.0:LRA=7:"
-                                 f"measured_I={loudnorm_data.get('measured_I', '-23')}:"
-                                 f"measured_TP={loudnorm_data.get('measured_TP', '-2.0')}:"
-                                 f"measured_LRA={loudnorm_data.get('measured_LRA', '7')}:"
-                                 f"measured_thresh={loudnorm_data.get('measured_thresh', '-33')}:"
-                                 f"offset={loudnorm_data.get('offset', '0.0')}")
+                loudnorm_filter = (
+                    f"loudnorm=I=-23:TP=-2.0:LRA=7:"
+                    f"measured_I={loudnorm_data.get('measured_I', '-23')}:"
+                    f"measured_TP={loudnorm_data.get('measured_TP', '-2.0')}:"
+                    f"measured_LRA={loudnorm_data.get('measured_LRA', '7')}:"
+                    f"measured_thresh={loudnorm_data.get('measured_thresh', '-33')}:"
+                    f"offset={loudnorm_data.get('offset', '0.0')}"
+                )
 
                 second_pass = [
-                    self.config['ffmpeg_path'], "-hide_banner", "-stats", "-y", "-i", str(job.input_path),
+                    self.config["ffmpeg_path"],
+                    "-hide_banner",
+                    "-stats",
+                    "-y",
+                    "-i",
+                    str(job.input_path),
                     # Map video and audio streams explicitly
-                    "-map", "0:v:0",  # Map first video stream
-                    "-map", "0:a:m:language:eng",  # Map first audio stream
-                    "-map", "0:s:m:language:eng", # Map english first sub
-                    "-vf", vf_filter, "-dolbyvision", "1" if video_info.has_dolby_vision else "0",
-                    "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-b:v", f"{crf_or_rate}k",
-                    "-preset", "slower", "-x265-params", f"pass=2:stats={stats_path}:{x265_params}",
-                    "-filter:a", loudnorm_filter, "-ac", "2", "-c:a", "libopus",
-                    "-b:a", f"{self.config['audio_bitrate_kbps']}k", "-frame_duration", "60"
+                    "-map",
+                    "0:v:0",  # Map first video stream
+                    "-map",
+                    "0:a:m:language:eng",  # Map first audio stream
+                    "-map",
+                    "0:s:m:language:eng",  # Map english first sub
+                    "-vf",
+                    vf_filter,
+                    "-dolbyvision",
+                    "1" if video_info.has_dolby_vision else "0",
+                    "-c:v",
+                    "libx265",
+                    "-pix_fmt",
+                    "yuv420p10le",
+                    "-b:v",
+                    f"{crf_or_rate}k",
+                    "-preset",
+                    "slower",
+                    "-x265-params",
+                    f"pass=2:stats={stats_path}:{x265_params}",
+                    "-filter:a",
+                    loudnorm_filter,
+                    "-ac",
+                    "2",
+                    "-c:a",
+                    "libopus",
+                    "-b:a",
+                    f"{self.config['audio_bitrate_kbps']}k",
+                    "-frame_duration",
+                    "60",
                 ]
 
                 # Add subtitle mappings
@@ -372,12 +600,17 @@ class VideoProcessor:
 
                 with job.token_path.open("a") as log_file:
                     process = await asyncio.create_subprocess_exec(
-                        *second_pass, stdout=log_file, stderr=log_file, stdin=asyncio.subprocess.DEVNULL
+                        *second_pass,
+                        stdout=log_file,
+                        stderr=log_file,
+                        stdin=asyncio.subprocess.DEVNULL,
                     )
                     await process.wait()
 
                 if process.returncode != 0:
-                    raise FFmpegError(f"Second pass failed with code {process.returncode}")
+                    raise FFmpegError(
+                        f"Second pass failed with code {process.returncode}"
+                    )
 
                 job.status = EncodingStatus.COMPLETED
                 self.logger.info(f"Two-pass encoding completed: {job.input_path.name}")
@@ -397,6 +630,7 @@ class VideoProcessor:
                     Path(temp_file).unlink(missing_ok=True)
                 job.temp_path = None
 
+
 class BatchProcessor:
     def __init__(self, config: dict):
         self.config = config
@@ -415,7 +649,11 @@ class BatchProcessor:
         self._shutdown_event.set()
 
     def _check_dependencies(self) -> bool:
-        missing = [tool for tool in [self.config['ffmpeg_path'], self.config['ffprobe_path']] if not which(tool)]
+        missing = [
+            tool
+            for tool in [self.config["ffmpeg_path"], self.config["ffprobe_path"]]
+            if not which(tool)
+        ]
         if missing:
             self.logger.error(f"Missing tools: {missing}")
             return False
@@ -444,7 +682,9 @@ class BatchProcessor:
             if job.status == EncodingStatus.FAILED and job.token_path.exists():
                 job.token_path.unlink(missing_ok=True)
 
-    async def _process_job(self, job: EncodingJob, semaphore: asyncio.Semaphore, scratch_dir: Path):
+    async def _process_job(
+        self, job: EncodingJob, semaphore: asyncio.Semaphore, scratch_dir: Path
+    ):
         async with semaphore:
             if self._shutdown_event.is_set():
                 job.status = EncodingStatus.SKIPPED
@@ -455,9 +695,16 @@ class BatchProcessor:
             async with self._job_context(job):
                 await self.processor.encode_video(job)
 
-    async def process_batch(self, input_files: List[Path], output_dir: Path,
-                          scratch_dir: Path, token_dir: Path, max_workers: int = 1) -> bool:
-        if not self._check_dependencies(): return False
+    async def process_batch(
+        self,
+        input_files: List[Path],
+        output_dir: Path,
+        scratch_dir: Path,
+        token_dir: Path,
+        max_workers: int = 1,
+    ) -> bool:
+        if not self._check_dependencies():
+            return False
 
         for directory in [output_dir, scratch_dir, token_dir]:
             directory.mkdir(parents=True, exist_ok=True)
@@ -473,7 +720,9 @@ class BatchProcessor:
             self.logger.info("No jobs to process")
             return True
 
-        self.logger.info(f"Processing {len(jobs)} jobs with {max_workers} workers using preset: {self.config['preset_name']}")
+        self.logger.info(
+            f"Processing {len(jobs)} jobs with {max_workers} workers using preset: {self.config['preset_name']}"
+        )
         semaphore = asyncio.Semaphore(max_workers)
         tasks = [self._process_job(job, semaphore, scratch_dir) for job in jobs]
 
@@ -486,43 +735,64 @@ class BatchProcessor:
         completed = sum(1 for job in jobs if job.status == EncodingStatus.COMPLETED)
         failed = sum(1 for job in jobs if job.status == EncodingStatus.FAILED)
         skipped = sum(1 for job in jobs if job.status == EncodingStatus.SKIPPED)
-        self.logger.info(f"Complete: {completed} succeeded, {failed} failed, {skipped} skipped")
+        self.logger.info(
+            f"Complete: {completed} succeeded, {failed} failed, {skipped} skipped"
+        )
         return failed == 0
 
+
 def parse_zone(s: Optional[str]) -> Optional[Tuple[int, float]]:
-    if not s: return None
+    if not s:
+        return None
     try:
         parts = s.split(",")
-        if len(parts) != 2: raise ValueError("Format: 'seconds,multiplier'")
+        if len(parts) != 2:
+            raise ValueError("Format: 'seconds,multiplier'")
         seconds, multiplier = int(parts[0]), float(parts[1])
-        if seconds < 0 or multiplier <= 0: raise ValueError("Invalid values")
+        if seconds < 0 or multiplier <= 0:
+            raise ValueError("Invalid values")
         return (seconds, multiplier)
     except (ValueError, IndexError) as e:
         raise argparse.ArgumentTypeError(f"Invalid format: {e}")
+
 
 def get_available_presets(ini_path: Path) -> List[str]:
     """Get list of available presets from INI file"""
     parser = ConfigParser()
     parser.read(ini_path)
     return [
-        section[7:] for section in parser.sections()
-        if section.startswith('preset_')
+        section[7:] for section in parser.sections() if section.startswith("preset_")
     ]
 
+
 async def main_async():
-    parser = argparse.ArgumentParser(description="Batch x265 encode with crop detection, 2-pass audio normalization, and grain control")
+    parser = argparse.ArgumentParser(
+        description="Batch x265 encode with crop detection, 2-pass audio normalization, and grain control"
+    )
 
     script_dir = Path(__file__).resolve().parent
-    parser.add_argument("-c", "--config", type=Path, default=script_dir / "presets.ini",
-                       help="Configuration file (default: presets.ini)")
-    parser.add_argument("-l", "--list-presets", action="store_true", help="List available presets and exit")
+    parser.add_argument(
+        "-c",
+        "--config",
+        type=Path,
+        default=script_dir / "presets.ini",
+        help="Configuration file (default: presets.ini)",
+    )
+    parser.add_argument(
+        "-l",
+        "--list-presets",
+        action="store_true",
+        help="List available presets and exit",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
 
     # Parse known args first to handle --list-presets without requiring other args
     known_args, remaining_args = parser.parse_known_args()
 
-    logging.basicConfig(level=logging.DEBUG if known_args.verbose else logging.INFO,
-                       format="%(asctime)s - %(levelname)s - %(message)s")
+    logging.basicConfig(
+        level=logging.DEBUG if known_args.verbose else logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
 
     if not known_args.config.exists():
         parser.error(f"Configuration file not found: {known_args.config}")
@@ -535,17 +805,41 @@ async def main_async():
         return 0
 
     # Add required arguments only if not listing presets
-    parser.add_argument("-i", "--inputs", nargs="+", type=Path, required=True, help="Input video files")
-    parser.add_argument("-o", "--output-dir", type=Path, required=True, help="Output directory")
-    parser.add_argument("-s", "--scratch-dir", type=Path, required=True, help="Temp directory")
-    parser.add_argument("-t", "--token-dir", type=Path, required=True, help="Token directory")
+    parser.add_argument(
+        "-i", "--inputs", nargs="+", type=Path, required=True, help="Input video files"
+    )
+    parser.add_argument(
+        "-o", "--output-dir", type=Path, required=True, help="Output directory"
+    )
+    parser.add_argument(
+        "-s", "--scratch-dir", type=Path, required=True, help="Temp directory"
+    )
+    parser.add_argument(
+        "-t", "--token-dir", type=Path, required=True, help="Token directory"
+    )
     parser.add_argument("-j", "--jobs", type=int, default=1, help="Concurrent jobs")
-    parser.add_argument("--title-rate", type=str, help="Title sequence rate 'seconds,multiplier'")
-    parser.add_argument("--closing-rate", type=str, help="Closing sequence rate 'seconds,multiplier'")
-    parser.add_argument("--skip-rate-for-first-episodes", action="store_true", help="Skip rates for E01 episodes")
-    parser.add_argument("-1", "--one-pass", action="store_true", help="Use one-pass processing")
-    parser.add_argument("-p", "--preset", type=str, required=True, default="none",
-                       help="Encoding preset (default: none)")
+    parser.add_argument(
+        "--title-rate", type=str, help="Title sequence rate 'seconds,multiplier'"
+    )
+    parser.add_argument(
+        "--closing-rate", type=str, help="Closing sequence rate 'seconds,multiplier'"
+    )
+    parser.add_argument(
+        "--skip-rate-for-first-episodes",
+        action="store_true",
+        help="Skip rates for E01 episodes",
+    )
+    parser.add_argument(
+        "-1", "--one-pass", action="store_true", help="Use one-pass processing"
+    )
+    parser.add_argument(
+        "-p",
+        "--preset",
+        type=str,
+        required=True,
+        default="none",
+        help="Encoding preset (default: none)",
+    )
 
     args = parser.parse_args()
 
@@ -556,14 +850,17 @@ async def main_async():
             title_rate=parse_zone(args.title_rate),
             closing_rate=parse_zone(args.closing_rate),
             skip_first_episodes=args.skip_rate_for_first_episodes,
-            one_pass=args.one_pass
+            one_pass=args.one_pass,
         )
     except (argparse.ArgumentTypeError, ValueError) as e:
         parser.error(str(e))
 
     processor = BatchProcessor(config)
-    success = await processor.process_batch(args.inputs, args.output_dir, args.scratch_dir, args.token_dir, args.jobs)
+    success = await processor.process_batch(
+        args.inputs, args.output_dir, args.scratch_dir, args.token_dir, args.jobs
+    )
     return 0 if success else 1
+
 
 def main():
     try:
@@ -571,6 +868,7 @@ def main():
     except KeyboardInterrupt:
         print("\nInterrupted")
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
