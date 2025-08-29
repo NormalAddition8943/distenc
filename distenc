@@ -495,7 +495,7 @@ class VideoProcessor:
 
                 stats_path = job.temp_path.with_suffix(".stats")
 
-                # First pass
+                # First pass, go faster by skipping "-vf", vf_filter,
                 first_pass = [
                     self.config["ffmpeg_path"],
                     "-hide_banner",
@@ -504,8 +504,6 @@ class VideoProcessor:
                     str(job.input_path),
                     "-map",
                     "0:v:0",
-                    "-vf",
-                    vf_filter,
                     "-dolbyvision",
                     "1" if video_info.has_dolby_vision else "0",
                     "-c:v",
