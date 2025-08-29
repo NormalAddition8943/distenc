@@ -53,6 +53,7 @@ class VideoInfo:
     crop_params: Optional[Tuple[int, int, int, int]] = None
     chapters: List[Tuple[float, Optional[float]]] = field(default_factory=list)
     text_subtitle_streams: List[int] = field(default_factory=list)
+    audio_stream_id: int = 0
 
 
 @dataclass
@@ -238,10 +239,40 @@ class VideoProcessor:
                     "en",
                     "english",
                 ]
-
                 if is_text_codec or is_forced_english:
                     info.text_subtitle_streams.append(i)
 
+        except:
+            pass
+
+        # Assign the first english audio stream otherwise default to 0
+        try:
+            result = await self._run_cmd(
+                [
+                    self.config["ffprobe_path"],
+                    "-v",
+                    "quiet",
+                    "-show_streams",
+                    "-select_streams",
+                    "a",
+                    "-print_format",
+                    "json",
+                    str(path),
+                ]
+            )
+            data = json.loads(result.stdout.decode())
+            for i, stream in enumerate(data.get("streams", [])):
+                # Is it a forced english subtitle? (which might be large graphic-based, but worth it because forced subtitles are critical)
+                tags = stream.get("tags", {})
+                language = tags.get("language", "").lower()
+                is_english = language in [
+                    "eng",
+                    "en",
+                    "english",
+                ]
+                if is_english:
+                    info.audio_stream_id = i
+                    break
         except:
             pass
 
@@ -408,10 +439,6 @@ class VideoProcessor:
                     # Map video and audio streams explicitly
                     "-map",
                     "0:v:0",  # Map first video stream
-                    "-map",
-                    "0:a:m:language:eng",  # Map first english audio stream
-                    "-map",
-                    "0:s:m:language:eng",  # Map first english subs
                     "-vf",
                     vf_filter,
                     "-dolbyvision",
@@ -426,6 +453,8 @@ class VideoProcessor:
                     "slower",
                     "-x265-params",
                     x265_params,
+                    "-map",
+                    f"0:a:{video_info.audio_stream_id}",
                     "-filter:a",
                     loudnorm_filter,
                     "-ac",
@@ -473,6 +502,8 @@ class VideoProcessor:
                     "-y",
                     "-i",
                     str(job.input_path),
+                    "-map",
+                    "0:v:0",
                     "-vf",
                     vf_filter,
                     "-dolbyvision",
@@ -487,13 +518,11 @@ class VideoProcessor:
                     "slower",
                     "-x265-params",
                     f"pass=1:stats={stats_path}:no-slow-firstpass=1:{x265_params}",
-                    "-map",
-                    "0:v:0",
                     "-f",
                     "null",
                     "/dev/null" if os.name != "nt" else "NUL",
                     "-map",
-                    "0:a:m:language:eng",
+                    f"0:a:{video_info.audio_stream_id}",
                     "-af",
                     "loudnorm=I=-23:TP=-2.0:LRA=7:print_format=json",
                     "-f",
@@ -562,10 +591,6 @@ class VideoProcessor:
                     # Map video and audio streams explicitly
                     "-map",
                     "0:v:0",  # Map first video stream
-                    "-map",
-                    "0:a:m:language:eng",  # Map first audio stream
-                    "-map",
-                    "0:s:m:language:eng",  # Map english first sub
                     "-vf",
                     vf_filter,
                     "-dolbyvision",
@@ -580,6 +605,8 @@ class VideoProcessor:
                     "slower",
                     "-x265-params",
                     f"pass=2:stats={stats_path}:{x265_params}",
+                    "-map",
+                    f"0:a:{video_info.audio_stream_id}",
                     "-filter:a",
                     loudnorm_filter,
                     "-ac",
