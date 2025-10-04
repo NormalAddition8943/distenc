@@ -54,7 +54,8 @@ class VideoInfo:
     chapters: List[Tuple[float, Optional[float]]] = field(default_factory=list)
     text_subtitle_streams: List[int] = field(default_factory=list)
     audio_stream_id: int = 0
-
+    width: Optional[int] = None
+    height: Optional[int] = None
 
 @dataclass
 class EncodingJob:
@@ -77,6 +78,27 @@ class VideoProcessor:
     def __init__(self, config: dict):
         self.config = config
         self.logger = logging.getLogger(__name__)
+        self._vaapi_available = None
+
+    async def _check_vaapi(self) -> bool:
+        """Check if VAAPI is available on the system"""
+        if self._vaapi_available is not None:
+            return self._vaapi_available
+
+        if os.name == 'nt':
+            self._vaapi_available = False
+            return False
+
+        try:
+            result = await self._run_cmd(
+                [self.config["ffmpeg_path"], "-hide_banner", "-hwaccels"],
+                timeout=5
+            )
+            self._vaapi_available = b'vaapi' in result.stdout
+            return self._vaapi_available
+        except:
+            self._vaapi_available = False
+            return False
 
     async def _run_cmd(
         self, cmd: List[str], timeout: int = 300
@@ -276,6 +298,29 @@ class VideoProcessor:
         except:
             pass
 
+        # Get video dimensions
+        try:
+            result = await self._run_cmd(
+                [
+                    self.config["ffprobe_path"],
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=width,height",
+                    "-of",
+                    "csv=p=0",
+                    str(path),
+                ]
+            )
+            width, height = result.stdout.decode().strip().split(',')
+            info.width = int(width)
+            info.height = int(height)
+        except:
+            pass
+
+
         return info
 
     async def detect_crop(self, video_info: VideoInfo) -> Tuple[int, int, int, int]:
@@ -378,6 +423,12 @@ class VideoProcessor:
     async def encode_video(self, job: EncodingJob) -> None:
         job.start_time = time.time()
         job.status = EncodingStatus.IN_PROGRESS
+        use_vaapi = await self._check_vaapi()
+        vaapi_decode = [
+                        "-hwaccel", "vaapi",
+                        "-hwaccel_device", "/dev/dri/renderD128",
+                        "-hwaccel_output_format", "vaapi",
+                    ]
 
         try:
             # Analyze video
@@ -404,17 +455,46 @@ class VideoProcessor:
 
             x265_params = ":".join(f"{k}={v}" for k, v in x265_params.items())
 
-            # Build video filter
+            needs_scaling = not (
+                video_info.width == self.config['target_width'] or
+                video_info.height == self.config['target_height']
+            )
+
+            # Build video filter (CPU or VAAPI)
             vf_parts = []
-            if self.config["video_filter"]:
-                vf_parts.append(self.config["video_filter"])
-            if self.config["scale_filter"]:
-                vf_parts.append(
-                    f"zscale={self.config['target_width']}:{self.config['target_height']}:filter={self.config['scale_filter']}"
-                )
+            if use_vaapi:
+                # VAAPI filter chain
+                if self.config["video_filter"]:
+                    vf_parts.append(self.config["video_filter"])
+
+                # Upload to hardware
+                #  -- is this needed if we've already decoded in vaapi?
+                vf_parts.append("format=nv12,hwupload")
+
+                # VAAPI scale and crop
+                if needs_scaling:
+                    vf_parts.append(f"scale_vaapi=w={self.config['target_width']}:h={self.config['target_height']}")
+
+                # crop_vaapi doesn't exist; always use SW
+                # vf_parts.append(f"crop_vaapi=w={crop_w}:h={crop_h}:x={crop_x}:y={crop_y}")
+
+                # Download from hardware
+                vf_parts.append("hwdownload,format=nv12")
+            else:
+                # CPU filter chain
+                if self.config["video_filter"]:
+                    vf_parts.append(self.config["video_filter"])
+
+                if self.config["scale_filter"] and needs_scaling:
+                    vf_parts.append(
+                        f"zscale={self.config['target_width']}:{self.config['target_height']}:filter={self.config['scale_filter']}"
+                    )
+
             vf_parts.append(f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}")
+
             if self.config["sharpen_filter"]:
                 vf_parts.append(self.config["sharpen_filter"])
+
             vf_filter = ",".join(vf_parts)
 
             zones = self.calculate_zones(video_info)
@@ -434,6 +514,13 @@ class VideoProcessor:
                     "-hide_banner",
                     "-stats",
                     "-y",
+                ]
+
+                # Add VAAPI decode if available
+                if use_vaapi:
+                    one_pass_cmd.extend(vaapi_decode)
+
+                one_pass_cmd.extend([
                     "-i",
                     str(job.input_path),
                     # Map video and audio streams explicitly
@@ -455,17 +542,17 @@ class VideoProcessor:
                     x265_params,
                     "-map",
                     f"0:a:{video_info.audio_stream_id}",
-                    "-filter:a",
-                    loudnorm_filter,
                     "-ac",
                     "2",
+                    "-filter:a",
+                    loudnorm_filter + ",aresample=matrix_encoding=dplii",
                     "-c:a",
                     "libopus",
                     "-b:a",
                     f"{self.config['audio_bitrate_kbps']}k",
                     "-frame_duration",
                     "60",
-                ]
+                ])
 
                 # Add subtitle mappings
                 one_pass_cmd.extend(subtitle_args)
@@ -500,6 +587,13 @@ class VideoProcessor:
                     self.config["ffmpeg_path"],
                     "-hide_banner",
                     "-y",
+                ]
+
+                # Add VAAPI decode if available
+                if use_vaapi:
+                    first_pass.extend(vaapi_decode)
+
+                first_pass.extend([
                     "-i",
                     str(job.input_path),
                     "-map",
@@ -528,7 +622,7 @@ class VideoProcessor:
                     "-f",
                     "null",
                     "-",
-                ]
+                ])
 
                 self.logger.debug(f"First pass: {' '.join(first_pass)}")
 
@@ -586,6 +680,13 @@ class VideoProcessor:
                     "-hide_banner",
                     "-stats",
                     "-y",
+                ]
+
+                # Add VAAPI decode if available
+                if use_vaapi:
+                    second_pass.extend(vaapi_decode)
+
+                second_pass.extend([
                     "-i",
                     str(job.input_path),
                     # Map video and audio streams explicitly
@@ -607,17 +708,17 @@ class VideoProcessor:
                     f"pass=2:stats={stats_path}:{x265_params}",
                     "-map",
                     f"0:a:{video_info.audio_stream_id}",
-                    "-filter:a",
-                    loudnorm_filter,
                     "-ac",
                     "2",
+                    "-filter:a",
+                    loudnorm_filter + ",aresample=matrix_encoding=dplii",
                     "-c:a",
                     "libopus",
                     "-b:a",
                     f"{self.config['audio_bitrate_kbps']}k",
                     "-frame_duration",
                     "60",
-                ]
+                ])
 
                 # Add subtitle mappings
                 second_pass.extend(subtitle_args)
