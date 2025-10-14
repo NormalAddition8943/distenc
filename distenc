@@ -283,7 +283,12 @@ class VideoProcessor:
                 ]
             )
             data = json.loads(result.stdout.decode())
-            for i, stream in enumerate(data.get("streams", [])):
+
+            # Use forced audio stream if specified, otherwise detect English
+            if self.config.get("force_audio_stream") is not None:
+                info.audio_stream_id = self.config["force_audio_stream"]
+            else:
+                for i, stream in enumerate(data.get("streams", [])):
                 # Is it a forced english subtitle? (which might be large graphic-based, but worth it because forced subtitles are critical)
                 tags = stream.get("tags", {})
                 language = tags.get("language", "").lower()
@@ -960,6 +965,11 @@ async def main_async():
     parser.add_argument(
         "-1", "--one-pass", action="store_true", help="Use one-pass processing"
     )
+     parser.add_argument(
+        "--audio-stream",
+        type=int,
+        help="Force audio stream index (0=first, 1=second, etc.)",
+    )
     parser.add_argument(
         "-p",
         "--preset",
@@ -978,6 +988,7 @@ async def main_async():
             title_rate=parse_zone(args.title_rate),
             closing_rate=parse_zone(args.closing_rate),
             skip_first_episodes=args.skip_rate_for_first_episodes,
+            force_audio_stream=args.audio_stream,
             one_pass=args.one_pass,
         )
     except (argparse.ArgumentTypeError, ValueError) as e:
