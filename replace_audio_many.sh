@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# Check input arguments
-if [ "$#" -ne 5 ]; then
-    echo "Usage: $0 script-src-tgt.sh source_dir source_prefix target_dir target_prefix"
+# Check minimum input arguments
+if [ "$#" -lt 5 ]; then
+    echo "Usage: $0 script-src-tgt.sh source_dir source_prefix target_dir target_prefix [extra-args...]"
     exit 1
 fi
 
@@ -11,14 +11,26 @@ SOURCE_DIR="$2"
 SOURCE_PREFIX="$3"
 TARGET_DIR="$4"
 TARGET_PREFIX="$5"
+shift 5
+
+# Any remaining arguments are passed through
+EXTRA_ARGS=("$@")
 
 for s in $(seq -w 1 12); do
   for e in $(seq -w 1 28); do
-    SOURCE_FILE=$(ls $SOURCE_DIR/$SOURCE_PREFIX*S${s}E${e}*.mkv)
-    TARGET_FILE=$(ls $TARGET_DIR/$TARGET_PREFIX*S${s}E${e}*.mkv)
+    # Use globbing safely; avoid word-splitting by using arrays
+    shopt -s nullglob
+    src_matches=("$SOURCE_DIR"/"$SOURCE_PREFIX"*S${s}E${e}*.mkv)
+    tgt_matches=("$TARGET_DIR"/"$TARGET_PREFIX"*S${s}E${e}*.mkv)
+    shopt -u nullglob
 
-    if [[ -f "$SOURCE_FILE" && -f "$TARGET_FILE" ]]; then
-      "$SCRIPT" "$SOURCE_FILE" "$TARGET_FILE"
+    # pick first match if any
+    SOURCE_FILE="${src_matches[0]}"
+    TARGET_FILE="${tgt_matches[0]}"
+
+    if [[ -n "$SOURCE_FILE" && -n "$TARGET_FILE" && -f "$SOURCE_FILE" && -f "$TARGET_FILE" ]]; then
+      # Invoke the script with source, target, then any extra args
+      "$SCRIPT" "$SOURCE_FILE" "$TARGET_FILE" "${EXTRA_ARGS[@]}"
     fi
   done
 done
