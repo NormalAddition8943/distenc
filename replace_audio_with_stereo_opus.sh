@@ -61,7 +61,7 @@ echo
 
 # Apply normalization (audio-only)
 ffmpeg -y -hide_banner -nostats -i "$SOURCE_VIDEO" -vn -map "a:$AUDIO_TRACK" \
-  -filter:a "loudnorm=I=-23:TP=-2.0:LRA=7:measured_I=$measured_I:measured_TP=$measured_TP:measured_LRA=$measured_LRA:measured_thresh=$measured_thresh:offset=$offset,aresample=matrix_encoding=dplii" \
+  -filter:a "loudnorm=I=-22:TP=-1.5:LRA=5:measured_I=$measured_I:measured_TP=$measured_TP:measured_LRA=$measured_LRA:measured_thresh=$measured_thresh:offset=$offset,aresample=matrix_encoding=dplii" \
   -ac 2 -c:a libopus -b:a 96k -frame_duration 60 "$ENCODED_AUDIO"
 
 # Replace audio in target video

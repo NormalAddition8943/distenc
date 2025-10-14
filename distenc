@@ -506,7 +506,7 @@ class VideoProcessor:
 
             if use_one_pass or self.config.get("one_pass"):
 
-                loudnorm_filter = "loudnorm=I=-23:TP=-2.0:LRA=7"
+                loudnorm_filter = "loudnorm=I=-22:TP=-1.5:LRA=5"
 
                 # Single-pass FFmpeg command
                 one_pass_cmd = [
@@ -618,7 +618,7 @@ class VideoProcessor:
                     "-map",
                     f"0:a:{video_info.audio_stream_id}",
                     "-af",
-                    "loudnorm=I=-23:TP=-2.0:LRA=7:print_format=json",
+                    "loudnorm=I=-22:TP=-1.5:LRA=5:print_format=json",
                     "-f",
                     "null",
                     "-",
@@ -667,10 +667,10 @@ class VideoProcessor:
 
                 # Second pass
                 loudnorm_filter = (
-                    f"loudnorm=I=-23:TP=-2.0:LRA=7:"
-                    f"measured_I={loudnorm_data.get('measured_I', '-23')}:"
-                    f"measured_TP={loudnorm_data.get('measured_TP', '-2.0')}:"
-                    f"measured_LRA={loudnorm_data.get('measured_LRA', '7')}:"
+                    f"loudnorm=I=-22:TP=-1.5:LRA=5:"
+                    f"measured_I={loudnorm_data.get('measured_I', '-22')}:"
+                    f"measured_TP={loudnorm_data.get('measured_TP', '-1.5')}:"
+                    f"measured_LRA={loudnorm_data.get('measured_LRA', '5')}:"
                     f"measured_thresh={loudnorm_data.get('measured_thresh', '-33')}:"
                     f"offset={loudnorm_data.get('offset', '0.0')}"
                 )
