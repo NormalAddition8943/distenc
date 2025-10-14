@@ -53,7 +53,7 @@ class VideoInfo:
     crop_params: Optional[Tuple[int, int, int, int]] = None
     chapters: List[Tuple[float, Optional[float]]] = field(default_factory=list)
     text_subtitle_streams: List[int] = field(default_factory=list)
-    audio_stream_id: int = 0
+    audio_stream_id: int = None
     width: Optional[int] = None
     height: Optional[int] = None
 
@@ -289,17 +289,17 @@ class VideoProcessor:
                 info.audio_stream_id = self.config["force_audio_stream"]
             else:
                 for i, stream in enumerate(data.get("streams", [])):
-                # Is it a forced english subtitle? (which might be large graphic-based, but worth it because forced subtitles are critical)
-                tags = stream.get("tags", {})
-                language = tags.get("language", "").lower()
-                is_english = language in [
-                    "eng",
-                    "en",
-                    "english",
-                ]
-                if is_english:
-                    info.audio_stream_id = i
-                    break
+                    # Is it a forced english subtitle? (which might be large graphic-based, but worth it because forced subtitles are critical)
+                    tags = stream.get("tags", {})
+                    language = tags.get("language", "").lower()
+                    is_english = language in [
+                        "eng",
+                        "en",
+                        "english",
+                    ]
+                    if is_english:
+                        info.audio_stream_id = i
+                        break
         except:
             pass
 
@@ -319,7 +319,7 @@ class VideoProcessor:
                     str(path),
                 ]
             )
-            width, height = result.stdout.decode().strip().split(',')
+            width, height = result.stdout.decode().strip().split()[0].split(',')
             info.width = int(width)
             info.height = int(height)
         except:
@@ -461,9 +461,11 @@ class VideoProcessor:
             x265_params = ":".join(f"{k}={v}" for k, v in x265_params.items())
 
             needs_scaling = not (
-                video_info.width == self.config['target_width'] or
-                video_info.height == self.config['target_height']
+                video_info.width == int(self.config['target_width']) or
+                video_info.height == int(self.config['target_height'])
             )
+            if needs_scaling:
+                self.logger.debug(f"Needs scaling: video={video_info.width}x{video_info.height} conf={self.config['target_width']}x{self.config['target_height']}")
 
             # Build video filter (CPU or VAAPI)
             vf_parts = []
@@ -474,7 +476,7 @@ class VideoProcessor:
 
                 # Upload to hardware
                 #  -- is this needed if we've already decoded in vaapi?
-                vf_parts.append("format=nv12,hwupload")
+                # vf_parts.append("format=nv12,hwupload")
 
                 # VAAPI scale and crop
                 if needs_scaling:
@@ -546,7 +548,7 @@ class VideoProcessor:
                     "-x265-params",
                     x265_params,
                     "-map",
-                    f"0:a:{video_info.audio_stream_id}",
+                    f"a:{video_info.audio_stream_id}",
                     "-ac",
                     "2",
                     "-filter:a",
@@ -621,7 +623,7 @@ class VideoProcessor:
                     "null",
                     "/dev/null" if os.name != "nt" else "NUL",
                     "-map",
-                    f"0:a:{video_info.audio_stream_id}",
+                    f"a:{video_info.audio_stream_id}",
                     "-af",
                     "loudnorm=I=-22:TP=-1.5:LRA=5:print_format=json",
                     "-f",
@@ -712,7 +714,7 @@ class VideoProcessor:
                     "-x265-params",
                     f"pass=2:stats={stats_path}:{x265_params}",
                     "-map",
-                    f"0:a:{video_info.audio_stream_id}",
+                    f"a:{video_info.audio_stream_id}",
                     "-ac",
                     "2",
                     "-filter:a",
@@ -965,7 +967,7 @@ async def main_async():
     parser.add_argument(
         "-1", "--one-pass", action="store_true", help="Use one-pass processing"
     )
-     parser.add_argument(
+    parser.add_argument(
         "--audio-stream",
         type=int,
         help="Force audio stream index (0=first, 1=second, etc.)",
