@@ -444,6 +444,8 @@ class VideoProcessor:
             video_info.crop_params = await self.detect_crop(video_info)
             crop_w, crop_h, crop_x, crop_y = video_info.crop_params
 
+            target_w, target_h = int(self.config['target_width']), int(self.config['target_height'])
+
             crf_or_rate = int(self.config["crf_or_rate"])
             use_one_pass = crf_or_rate <= 50
 
@@ -460,44 +462,34 @@ class VideoProcessor:
 
             x265_params = ":".join(f"{k}={v}" for k, v in x265_params.items())
 
-            needs_scaling = not (
-                video_info.width == int(self.config['target_width']) or
-                video_info.height == int(self.config['target_height'])
-            )
-            if needs_scaling:
-                self.logger.debug(f"Needs scaling: video={video_info.width}x{video_info.height} conf={self.config['target_width']}x{self.config['target_height']}")
-
             # Build video filter (CPU or VAAPI)
             vf_parts = []
             if use_vaapi:
-                # VAAPI filter chain
-                if self.config["video_filter"]:
-                    vf_parts.append(self.config["video_filter"])
-
-                # Upload to hardware
-                #  -- is this needed if we've already decoded in vaapi?
-                # vf_parts.append("format=nv12,hwupload")
-
-                # VAAPI scale and crop
-                if needs_scaling:
-                    vf_parts.append(f"scale_vaapi=w={self.config['target_width']}:h={self.config['target_height']}")
-
-                # crop_vaapi doesn't exist; always use SW
-                # vf_parts.append(f"crop_vaapi=w={crop_w}:h={crop_h}:x={crop_x}:y={crop_y}")
-
                 # Download from hardware
                 vf_parts.append("hwdownload,format=nv12")
-            else:
-                # CPU filter chain
-                if self.config["video_filter"]:
-                    vf_parts.append(self.config["video_filter"])
 
-                if self.config["scale_filter"] and needs_scaling:
-                    vf_parts.append(
-                        f"zscale={self.config['target_width']}:{self.config['target_height']}:filter={self.config['scale_filter']}"
-                    )
+            # CPU filter chain
+            if self.config["video_filter"]:
+                vf_parts.append(self.config["video_filter"])
 
-            vf_parts.append(f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}")
+            one_scale_dim_matches_target = video_info.width == target_w or video_info.height == target_h
+
+            needs_scaling = not one_scale_dim_matches_target
+
+            if needs_scaling and self.config["scale_filter"]:
+                self.logger.debug(f"Needs scaling: video={video_info.width}x{video_info.height} conf={target_w}x{target_h}")
+                vf_parts.append(
+                    f"zscale={self.config['target_width']}:{self.config['target_height']}:filter={self.config['scale_filter']}"
+                )
+
+            one_crop_dim_matches_target = crop_w == target_w or crop_h == target_h
+            extents_are_cropped = crop_x != 0 or crop_y != 0
+
+            needs_cropping = (not one_crop_dim_matches_target or extents_are_cropped)
+
+            if needs_cropping:
+                self.logger.debug(f"Needs cropping: video={video_info.width}x{video_info.height}, scale={target_w}x{target_h}, crop={crop_w}-{crop_x}x{crop_h}-{crop_y}")
+                vf_parts.append(f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}")
 
             if self.config["sharpen_filter"]:
                 vf_parts.append(self.config["sharpen_filter"])
@@ -532,7 +524,7 @@ class VideoProcessor:
                     str(job.input_path),
                     # Map video and audio streams explicitly
                     "-map",
-                    "0:v:0",  # Map first video stream
+                    "v:0",  # Map first video stream
                     "-vf",
                     vf_filter,
                     "-dolbyvision",
@@ -604,7 +596,7 @@ class VideoProcessor:
                     "-i",
                     str(job.input_path),
                     "-map",
-                    "0:v:0",
+                    "v:0",
                     "-vf",
                     vf_filter,
                     "-dolbyvision",
