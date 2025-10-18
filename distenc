@@ -300,6 +300,10 @@ class VideoProcessor:
                     if is_english:
                         info.audio_stream_id = i
                         break
+            if info.audio_stream_id is None:
+                self.logger.warning("Could not find an English audio track; using stream 0")
+                info.audio_stream_id = 0
+
         except:
             pass
 
@@ -367,7 +371,8 @@ class VideoProcessor:
                 pass
 
         if not crops:
-            raise FFmpegError("No crop parameters detected")
+            self.logger.warning("Could not detect cropping parameters; defaulting to no-crop")
+            return None
 
         # Find bounding box
         min_x = min(crop[2] for crop in crops)
@@ -444,7 +449,6 @@ class VideoProcessor:
                 raise FFmpegError("Could not determine video duration")
 
             video_info.crop_params = await self.detect_crop(video_info)
-            crop_w, crop_h, crop_x, crop_y = video_info.crop_params
 
             target_w, target_h = int(self.config['target_width']), int(self.config['target_height'])
 
@@ -484,8 +488,10 @@ class VideoProcessor:
                     f"zscale={self.config['target_width']}:{self.config['target_height']}:filter={self.config['scale_filter']}"
                 )
 
-            self.logger.debug(f"Needs cropping: video={video_info.width}x{video_info.height}, scale={target_w}x{target_h}, crop={crop_w}-{crop_x}x{crop_h}-{crop_y}")
-            vf_parts.append(f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}")
+            if video_info.crop_params is not None:
+                crop_w, crop_h, crop_x, crop_y = video_info.crop_params
+                self.logger.debug(f"Needs cropping: video={video_info.width}x{video_info.height}, scale={target_w}x{target_h}, crop={crop_w}-{crop_x}x{crop_h}-{crop_y}")
+                vf_parts.append(f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}")
 
             if self.config["sharpen_filter"]:
                 vf_parts.append(self.config["sharpen_filter"])
@@ -500,8 +506,6 @@ class VideoProcessor:
             subtitle_args = self.build_subtitle_mapping(video_info)
 
             if use_one_pass or self.config.get("one_pass"):
-
-                loudnorm_filter = "loudnorm=I=-22:TP=-1.5:LRA=5"
 
                 # Single-pass FFmpeg command
                 one_pass_cmd = [
@@ -537,17 +541,29 @@ class VideoProcessor:
                     x265_params,
                     "-map",
                     f"a:{video_info.audio_stream_id}",
-                    "-ac",
-                    "2",
-                    "-filter:a",
-                    loudnorm_filter + ",aresample=matrix_encoding=dplii",
-                    "-c:a",
-                    "libopus",
-                    "-b:a",
-                    f"{self.config['audio_bitrate_kbps']}k",
-                    "-frame_duration",
-                    "60",
                 ])
+
+                # Add audio copy or encoding based on config
+                if self.config.get("copy_audio"):
+                    one_pass_cmd.extend([
+                        "-c:a",
+                        "copy",
+                    ])
+                else:
+                    loudnorm_filter = "loudnorm=I=-22:TP=-1.5:LRA=5"
+
+                    one_pass_cmd.extend([
+                        "-ac",
+                        "2",
+                        "-filter:a",
+                        loudnorm_filter + ",aresample=matrix_encoding=dplii",
+                        "-c:a",
+                        "libopus",
+                        "-b:a",
+                        f"{self.config['audio_bitrate_kbps']}k",
+                        "-frame_duration",
+                        "60",
+                    ])
 
                 # Add subtitle mappings
                 one_pass_cmd.extend(subtitle_args)
@@ -574,7 +590,6 @@ class VideoProcessor:
 
             else:
                 # Two-pass encoding
-
                 stats_path = job.temp_path.with_suffix(".stats")
 
                 # First pass
@@ -610,14 +625,24 @@ class VideoProcessor:
                     "-f",
                     "null",
                     "/dev/null" if os.name != "nt" else "NUL",
-                    "-map",
-                    f"a:{video_info.audio_stream_id}",
-                    "-af",
-                    "loudnorm=I=-22:TP=-1.5:LRA=5:print_format=json",
-                    "-f",
-                    "null",
-                    "-",
                 ])
+
+                if self.config.get("copy_audio"):
+                    # Explicitly ignore audio streams in first pass if we're simply copying it
+                    first_pass.extend([
+                        "-an",
+                    ])
+                else:
+                    # Analyze audio in first pass if we're going to encode it
+                    first_pass.extend([
+                        "-map",
+                        f"a:{video_info.audio_stream_id}",
+                        "-af",
+                        "loudnorm=I=-22:TP=-1.5:LRA=5:print_format=json",
+                        "-f",
+                        "null",
+                        "-",
+                    ])
 
                 self.logger.debug(f"First pass: {' '.join(first_pass)}")
 
@@ -634,41 +659,6 @@ class VideoProcessor:
                     raise FFmpegError(
                         f"First pass failed with code {process.returncode}"
                     )
-
-                # Extract loudnorm measurements
-                loudnorm_data = {}
-                with job.token_path.open("r") as log_file:
-                    for line in log_file:
-                        if '"input_i"' in line:
-                            loudnorm_data["measured_I"] = re.search(
-                                r'"input_i"\s*:\s*"([^"]*)"', line
-                            ).group(1)
-                        elif '"input_tp"' in line:
-                            loudnorm_data["measured_TP"] = re.search(
-                                r'"input_tp"\s*:\s*"([^"]*)"', line
-                            ).group(1)
-                        elif '"input_lra"' in line:
-                            loudnorm_data["measured_LRA"] = re.search(
-                                r'"input_lra"\s*:\s*"([^"]*)"', line
-                            ).group(1)
-                        elif '"input_thresh"' in line:
-                            loudnorm_data["measured_thresh"] = re.search(
-                                r'"input_thresh"\s*:\s*"([^"]*)"', line
-                            ).group(1)
-                        elif '"target_offset"' in line:
-                            loudnorm_data["offset"] = re.search(
-                                r'"target_offset"\s*:\s*"([^"]*)"', line
-                            ).group(1)
-
-                # Second pass
-                loudnorm_filter = (
-                    f"loudnorm=I=-22:TP=-1.5:LRA=5:"
-                    f"measured_I={loudnorm_data.get('measured_I', '-22')}:"
-                    f"measured_TP={loudnorm_data.get('measured_TP', '-1.5')}:"
-                    f"measured_LRA={loudnorm_data.get('measured_LRA', '5')}:"
-                    f"measured_thresh={loudnorm_data.get('measured_thresh', '-33')}:"
-                    f"offset={loudnorm_data.get('offset', '0.0')}"
-                )
 
                 second_pass = [
                     self.config["ffmpeg_path"],
@@ -703,17 +693,62 @@ class VideoProcessor:
                     f"pass=2:stats={stats_path}:{x265_params}",
                     "-map",
                     f"a:{video_info.audio_stream_id}",
-                    "-ac",
-                    "2",
-                    "-filter:a",
-                    loudnorm_filter + ",aresample=matrix_encoding=dplii",
-                    "-c:a",
-                    "libopus",
-                    "-b:a",
-                    f"{self.config['audio_bitrate_kbps']}k",
-                    "-frame_duration",
-                    "60",
                 ])
+
+                # Add audio copy or encoding based on config
+                if self.config.get("copy_audio"):
+                    second_pass.extend([
+                        "-c:a",
+                        "copy",
+                    ])
+                else:
+                    # Extract loudnorm measurements (only if we're encoded audio)
+                    loudnorm_data = {}
+
+                    with job.token_path.open("r") as log_file:
+                        for line in log_file:
+                            if '"input_i"' in line:
+                                loudnorm_data["measured_I"] = re.search(
+                                    r'"input_i"\s*:\s*"([^"]*)"', line
+                                ).group(1)
+                            elif '"input_tp"' in line:
+                                loudnorm_data["measured_TP"] = re.search(
+                                    r'"input_tp"\s*:\s*"([^"]*)"', line
+                                ).group(1)
+                            elif '"input_lra"' in line:
+                                loudnorm_data["measured_LRA"] = re.search(
+                                    r'"input_lra"\s*:\s*"([^"]*)"', line
+                                ).group(1)
+                            elif '"input_thresh"' in line:
+                                loudnorm_data["measured_thresh"] = re.search(
+                                    r'"input_thresh"\s*:\s*"([^"]*)"', line
+                                ).group(1)
+                            elif '"target_offset"' in line:
+                                loudnorm_data["offset"] = re.search(
+                                    r'"target_offset"\s*:\s*"([^"]*)"', line
+                                ).group(1)
+
+                    loudnorm_filter = (
+                        f"loudnorm=I=-22:TP=-1.5:LRA=5:"
+                        f"measured_I={loudnorm_data.get('measured_I', '-22')}:"
+                        f"measured_TP={loudnorm_data.get('measured_TP', '-1.5')}:"
+                        f"measured_LRA={loudnorm_data.get('measured_LRA', '5')}:"
+                        f"measured_thresh={loudnorm_data.get('measured_thresh', '-33')}:"
+                        f"offset={loudnorm_data.get('offset', '0.0')}"
+                    )
+
+                    second_pass.extend([
+                        "-ac",
+                        "2",
+                        "-filter:a",
+                        loudnorm_filter + ",aresample=matrix_encoding=dplii",
+                        "-c:a",
+                        "libopus",
+                        "-b:a",
+                        f"{self.config['audio_bitrate_kbps']}k",
+                        "-frame_duration",
+                        "60",
+                    ])
 
                 # Add subtitle mappings
                 second_pass.extend(subtitle_args)
@@ -961,6 +996,11 @@ async def main_async():
         help="Force audio stream index (0=first, 1=second, etc.)",
     )
     parser.add_argument(
+        "--copy-audio",
+        action="store_true",
+        help="Copy audio stream without re-encoding (skips loudnorm and Opus transcoding)",
+    )
+    parser.add_argument(
         "-p",
         "--preset",
         type=str,
@@ -980,6 +1020,7 @@ async def main_async():
             skip_first_episodes=args.skip_rate_for_first_episodes,
             force_audio_stream=args.audio_stream,
             one_pass=args.one_pass,
+            copy_audio=args.copy_audio,
         )
     except (argparse.ArgumentTypeError, ValueError) as e:
         parser.error(str(e))
