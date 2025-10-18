@@ -332,11 +332,11 @@ class VideoProcessor:
         if not video_info.duration:
             raise FFmpegError("Cannot detect crop without duration")
 
-        interval = video_info.duration / self.config["crop_samples"]
+        interval = video_info.duration / (self.config["crop_samples"] + 2)
         crops = []
 
         for i in range(self.config["crop_samples"]):
-            timestamp = i * interval
+            timestamp = (i + 1) * interval
             try:
                 result = await self._run_cmd(
                     [
@@ -347,9 +347,9 @@ class VideoProcessor:
                         "-i",
                         str(video_info.path),
                         "-frames:v",
-                        "5",
+                        "20",
                         "-vf",
-                        f"scale={self.config['target_width']}:{self.config['target_height']},cropdetect=round=2",
+                        f"scale={self.config['target_width']}:{self.config['target_height']},cropdetect=118:2:0",
                         "-f",
                         "null",
                         "/dev/null" if os.name != "nt" else "NUL",
@@ -361,6 +361,8 @@ class VideoProcessor:
                 )
                 if matches:
                     crops.append(tuple(map(int, matches[-1])))
+                    self.logger.debug(f"Crop data: {crops}")
+
             except:
                 pass
 
@@ -482,14 +484,8 @@ class VideoProcessor:
                     f"zscale={self.config['target_width']}:{self.config['target_height']}:filter={self.config['scale_filter']}"
                 )
 
-            one_crop_dim_matches_target = crop_w == target_w or crop_h == target_h
-            extents_are_cropped = crop_x != 0 or crop_y != 0
-
-            needs_cropping = (not one_crop_dim_matches_target or extents_are_cropped)
-
-            if needs_cropping:
-                self.logger.debug(f"Needs cropping: video={video_info.width}x{video_info.height}, scale={target_w}x{target_h}, crop={crop_w}-{crop_x}x{crop_h}-{crop_y}")
-                vf_parts.append(f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}")
+            self.logger.debug(f"Needs cropping: video={video_info.width}x{video_info.height}, scale={target_w}x{target_h}, crop={crop_w}-{crop_x}x{crop_h}-{crop_y}")
+            vf_parts.append(f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}")
 
             if self.config["sharpen_filter"]:
                 vf_parts.append(self.config["sharpen_filter"])
