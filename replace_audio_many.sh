@@ -20,8 +20,8 @@ for s in $(seq -w 1 12); do
   for e in $(seq -w 1 28); do
     # Use globbing safely; avoid word-splitting by using arrays
     shopt -s nullglob
-    src_matches=("$SOURCE_DIR"/"$SOURCE_PREFIX"*S${s}E${e}*.mkv)
-    tgt_matches=("$TARGET_DIR"/"$TARGET_PREFIX"*S${s}E${e}*.mkv)
+    src_matches=("$SOURCE_DIR"/"$SOURCE_PREFIX"*S${s}[Ee]${e}*.mkv)
+    tgt_matches=("$TARGET_DIR"/"$TARGET_PREFIX"*S${s}[Ee]${e}*.mkv)
     shopt -u nullglob
 
     # pick first match if any
